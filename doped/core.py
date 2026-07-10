@@ -14,7 +14,8 @@ from monty.serialization import dumpfn, loadfn
 from pymatgen.analysis.defects import core, thermo, utils
 from pymatgen.core.bond_valence import BVAnalyzer
 from pymatgen.core.entries import ComputedEntry, ComputedStructureEntry
-from pymatgen.core.structure_matcher import SpeciesComparator
+from pymatgen.core.structure_matcher import ElementComparator, SpeciesComparator
+from pymatgen.core.periodic_table import DummySpecies
 from pymatgen.io.vasp.outputs import Locpot, Outcar, Procar, Vasprun
 from pymatgen.util.typing import PathLike
 from scipy.constants import value as constants_value
@@ -2253,6 +2254,7 @@ class Defect(core.Defect):
         symprec: float = 0.01,
         angle_tolerance: float = 5,
         user_charges: list[int] | None = None,
+        map_to_unit_cell: bool = True,
         **doped_kwargs,
     ):
         """
@@ -2285,6 +2287,11 @@ class Defect(core.Defect):
                 ``get_charge_states`` will return this list. If ``None`` or
                 an empty list, the charge states will be determined
                 automatically.
+            map_to_unit_cell (bool):
+                Whether to map ``site`` to the unit cell upon initialisation. 
+                Default is ``True``, but should be set to ``False`` for
+                constituent point defects of a complex defect, such that their
+                relative geometry is not lost.
             **doped_kwargs:
                 Additional keyword arguments to define doped-specific
                 attributes (listed below), in the form
@@ -2292,7 +2299,8 @@ class Defect(core.Defect):
         """
         super().__init__(
             structure=structure,
-            site=site.to_unit_cell(),  # ensure mapped to unit cell
+            site=site.to_unit_cell() if map_to_unit_cell else site,  # mapped to unit cell unless disabled
+            # eg for constituent point defects of a complex to preserve relative geometry
             multiplicity=multiplicity,
             oxi_state=0,  # set oxi_state in more efficient and robust way below (crashes for large
             # input structures)
@@ -3183,3 +3191,53 @@ class Interstitial(Defect, core.Interstitial):
         """
         frac_coords_string = ",".join(f"{x:.3f}" for x in self.site.frac_coords)
         return f"{self.name} interstitial defect at site [{frac_coords_string}] in structure"
+
+
+class DefectComplex(core.DefectComplex, Defect):
+    def __init__(self,
+        defects: list[list[Defect]],
+        oxi_state: float | str | None = None,
+        equivalent_complexes: list[PeriodicSite] | None = None,
+        **doped_kwargs):
+        """
+        Subclass of :class:`~pymatgen.analysis.defects.core.DefectComplex` with
+        additional attributes and methods used by ``doped``.
+        """
+        self.defects = defects
+        self.equivalent_complexes = equivalent_complexes
+        self.structure = defects[0].structure
+        centroid_fc = np.mean([point_defect.site.frac_coords
+                               for point_defect in defects], axis=0)
+        centroid_site = PeriodicSite(
+            species=DummySpecies(),
+            coords=centroid_fc,
+            lattice=self.structure.lattice,
+        )
+        calc_multiplicity = "multiplicity" not in doped_kwargs
+        doped_kwargs.setdefault("multiplicity", 1)  # see Interstitial
+        Defect.__init__(
+            self,
+            structure=defects[0].structure,
+            site=centroid_site,
+            oxi_state=oxi_state,
+            **doped_kwargs
+            )
+        if calc_multiplicity:
+            self.multiplicity = self.get_multiplicity()
+
+        # TODO: map to unit cell consistently
+
+    def get_multiplicity(self, **kwargs) -> int:
+        """
+        Temporary multiplicity of the defect complex to override core.DefectComplex
+        """
+        if self.equivalent_complexes is not None:
+            return len(self.equivalent_complexes)
+        return 1
+        # TODO: compute multiplicity
+
+    def __repr__(self) -> str:
+        """
+        String representation of a complex defect.
+        """
+        return f"Complex defect containing: [{', '.join(str(point_defect) for point_defect in self.defects)}]"

@@ -573,6 +573,8 @@ def get_defect_type_and_composition_diff(
     return defect_type, composition_diff
 
 
+# TODO: deprecated? replaced by get_point_defect_types_and_site_indices and can use get_defect_type_and_composition_diff if necessary?
+# but check what's going on with site_tol warning etc
 def get_defect_type_and_site_indices(
     defect_supercell: Structure,
     bulk_supercell: Structure,
@@ -586,7 +588,9 @@ def get_defect_type_and_site_indices(
     substitutions) and defect (interstitials / substitutions) supercells.
 
     Defect sites are determined by matching sites in the bulk and defect
-    structures (by element and distances), according to ``site_tol``.
+    structures (by element and distances), according to ``site_tol``. The defect
+    type is determined only by composition difference between the bulk
+    and defect structures.
 
     Note that this assumes consistent cell definitions (lattice vectors and
     bases) for the input defect and bulk supercells, and does not perform any
@@ -623,8 +627,8 @@ def get_defect_type_and_site_indices(
 
     Returns:
         defect_type (str):
-            The type of defect as a string (``interstitial``, ``vacancy`` or
-            ``substitution``).
+            The type of defect as a string (``interstitial``, ``vacancy``,
+            ``substitution``, or ``complex``).
         missing_bulk_site_indices (list[int]):
             Indices of sites in the bulk structure that do not match any site
             in the defect structure (according to ``site_tol`` choice).
@@ -709,6 +713,143 @@ def get_defect_type_and_site_indices(
 
     return defect_type, missing_bulk_site_indices, additional_defect_site_indices
 
+
+
+def get_point_defect_types_and_site_indices(
+    defect_supercell: Structure,
+    bulk_supercell: Structure,
+    site_tol: float = 0.5,
+    abs_tol: bool = False,
+    use_oxi_states: bool = False,
+    use_rms: bool = False,
+) -> list[tuple[str, int | None, int | None]]:
+    """
+    Get the defect type, and indices of defect sites in the bulk (vacancies /
+    substitutions) and defect (interstitials / substitutions) supercells.
+
+    Defect sites are determined by matching sites in the bulk and defect
+    structures (by element and distances), according to ``site_tol``.
+    Defect types are then determined based on these matched sites.
+
+    Note that this assumes consistent cell definitions (lattice vectors and
+    bases) for the input defect and bulk supercells, and does not perform any
+    structural re-orientations.
+
+    Args:
+        defect_supercell (|Structure|):
+            The defect supercell structure.
+        bulk_supercell (|Structure|):
+            The bulk supercell structure.
+        site_tol (float):
+            The (fractional) tolerance for matching sites between the defect
+            and bulk structures. If ``abs_tol`` is ``False`` (default), then
+            the distance threshold for matching is set to the product of
+            ``site_tol`` and the shortest bond length in the bulk structure for
+            the species at the bulk site, otherwise the value is used directly 
+            (as a length in Å). Default is 0.5 (i.e. half the shortest bond 
+            length in the bulk structure for the species at a bulk site).
+        abs_tol (bool):
+            Whether to use ``site_tol`` as an absolute distance tolerance (in
+            Å) instead of a fractional tolerance (in terms of the shortest bond
+            length in the structure). Default is ``False``.
+        use_oxi_states (bool):
+            Whether to use the oxidation states of the sites in the bulk and
+            defect structures when considering matching sites (such that e.g.
+            ``Fe3+`` and ``Fe2+`` would be considered different species).
+            Default is ``False``.
+        use_rms (bool):
+            Site mapping (using linear assignment) -- used to determine defect
+            sites -- will be that which minimises either the summed RMS
+            distances (if ``use_rms`` is ``True``) or just simple linear sum of
+            distances (if ``False``, default) between all paired sites.
+
+    Returns:
+        point_defects (list[tuple[str, int, int]]):
+            A list of tuples representing the point defects found, where each 
+            tuple contains:
+            - The type of defect (``interstitial``, ``vacancy``, or ``substitution``).
+            - The index of the site in the bulk structure (or None for interstitials).
+            - The index of the site in the defect structure (or None for vacancies).
+    """
+    bulk_composition = bulk_supercell.composition
+    defect_composition = defect_supercell.composition
+
+    oxi_state_decorated = [  # if all sites in both structures are not oxi-state decorated / neutral
+        any(i in site.species_string for i in ["+", "-", "0"])
+        for site in [*bulk_supercell.sites, *defect_supercell.sites]
+    ]
+    if len(set(oxi_state_decorated)) > 1 and use_oxi_states:  # not consistent, ignore oxi states:
+        warnings.warn(
+            "`use_oxi_states` was set to `True`, but not all sites in the bulk and defect structures are "
+            "oxidation state decorated. Setting `use_oxi_states` to `False`."
+        )
+        use_oxi_states = False
+
+    elt_symbols = {
+        str(species) if use_oxi_states else species.symbol
+        for species in bulk_composition.elements + defect_composition.elements
+    }
+    additional_defect_site_indices = []
+    missing_bulk_site_indices = []
+    bulk_dist_tols = {}
+    distance_matrix = bulk_supercell.distance_matrix
+
+    for elt_symbol in elt_symbols:
+        bulk_species_coords, bulk_species_indices = get_coords_and_idx_of_species(
+            bulk_supercell, elt_symbol, use_oxi_states=use_oxi_states
+        )
+        defect_species_coords, defect_species_indices = get_coords_and_idx_of_species(
+            defect_supercell, elt_symbol, use_oxi_states=use_oxi_states
+        )
+        if bulk_species_indices.size == 0:  # extrinsic species
+            site_dist_tol = None
+        else:
+            species_distances = distance_matrix[bulk_species_indices]
+            species_min_dist = max(species_distances[np.nonzero(species_distances)].min(), 1)
+            site_dist_tol = site_tol if site_tol is None or abs_tol else site_tol * species_min_dist
+
+        site_mapping = _get_site_mapping_from_coords_and_indices(
+            bulk_species_coords,
+            defect_species_coords,
+            lattice=bulk_supercell.lattice,
+            s1_indices=bulk_species_indices,
+            s2_indices=defect_species_indices,
+            use_rms=use_rms,
+        )
+        defect_site_mappings = [
+            mapping
+            for mapping in site_mapping
+            if mapping[0] is None or (site_dist_tol is not None and mapping[0] > site_dist_tol)
+        ]
+        for mapping in defect_site_mappings:
+            if mapping[1] is not None:  # missing bulk site
+                missing_bulk_site_indices.append(mapping[1])
+                bulk_dist_tols[mapping[1]] = site_dist_tol # record tolerance for this site
+            if mapping[2] is not None:  # additional defect site (may be from same matched tuple if dist
+                additional_defect_site_indices.append(mapping[2])  # greater than site_dist_tol)
+
+    unmatched_site_mapping = _get_site_mapping_from_coords_and_indices(
+        bulk_supercell.frac_coords[missing_bulk_site_indices],
+        defect_supercell.frac_coords[additional_defect_site_indices],
+        lattice=bulk_supercell.lattice,
+        s1_indices=missing_bulk_site_indices,
+        s2_indices=additional_defect_site_indices,
+        use_rms=use_rms,
+    ) # get mapping of missing bulk sites to additional defect sites to determine if they are substitutions
+
+    point_defects = []
+    for dist, bulk_idx, defect_idx in unmatched_site_mapping:
+        sub_dist_tol = bulk_dist_tols.get(bulk_idx)  # tolerance for this missing bulk site (None if no site)
+        if bulk_idx is not None and defect_idx is not None and dist is not None and sub_dist_tol is not None and dist <= sub_dist_tol:
+            point_defects.append(("substitution", bulk_idx, defect_idx))
+        else:
+            if bulk_idx is not None:
+                point_defects.append(("vacancy", bulk_idx, None))
+            if defect_idx is not None:
+                point_defects.append(("interstitial", None, defect_idx))
+
+    return point_defects
+    
 
 def get_coords_and_idx_of_species(
     structure_or_sites: SiteCollection,

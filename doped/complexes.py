@@ -29,6 +29,7 @@ from doped.utils.symmetry import (
     get_equiv_frac_coords_in_primitive,
     get_primitive_structure,
     is_periodic_image,
+    _rotate_and_get_supercell_matrix,
 )
 
 if TYPE_CHECKING:
@@ -1225,3 +1226,44 @@ def get_split_vacancies_from_database(*args, verbose: bool | str = False):
     TODO.
     """
     raise NotImplementedError("Not implemented yet.")
+
+def _get_transformation_to_primitive(
+    prim_struct: Structure,
+    sc_struct: Structure,
+    ltol: float = 1e-5,
+    atol: float = 1,
+)  -> tuple[Structure, np.ndarray, np.ndarray]:
+    """Get the actual transformation from the supercell to the primitive structure,
+    i.e. matrix M and fc shift c such that prim_fc = sc_fc @ M + c"""
+
+    aligned_prim, sc_matrix = _rotate_and_get_supercell_matrix(
+        prim_struct,
+        sc_struct,
+        ltol=ltol,
+        atol=atol)
+
+    # TODO: draft structure match
+    struct_in_prim_lattice = sc_struct.frac_coords @ sc_matrix
+    ref_in_prim_lattice = struct_in_prim_lattice[0]
+    ref_symbol = sc_struct[0].specie.symbol
+    sc_symbols = np.array([site.specie.symbol for site in sc_struct])
+    prim_symbols = np.array([site.specie.symbol for site in aligned_prim])
+    species_match = sc_symbols[:, None] == prim_symbols[None, :]  
+
+    for prim_idx, prim_site in enumerate(aligned_prim):
+        if prim_symbols[prim_idx] == ref_symbol:
+            candidate_offset = prim_site.frac_coords - ref_in_prim_lattice
+            dists = aligned_prim.lattice.get_all_distances(
+                struct_in_prim_lattice + candidate_offset, aligned_prim.frac_coords
+            )
+            if np.all(np.where(species_match, dists, np.inf).min(axis=1) < 0.1):
+                return aligned_prim, sc_matrix, candidate_offset 
+
+    raise ValueError("Couldn't get transformation to primitive")
+
+    
+    
+
+    
+
+    
