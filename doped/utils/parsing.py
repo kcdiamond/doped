@@ -573,7 +573,8 @@ def get_defect_type_and_composition_diff(
     return defect_type, composition_diff
 
 
-# TODO: deprecated? replaced by get_point_defect_types_and_site_indices and can use get_defect_type_and_composition_diff if necessary?
+# TODO: deprecated? replaced by get_point_defect_types_and_site_indices and can use
+# get_defect_type_and_composition_diff if necessary?
 # but check what's going on with site_tol warning etc
 def get_defect_type_and_site_indices(
     defect_supercell: Structure,
@@ -714,7 +715,6 @@ def get_defect_type_and_site_indices(
     return defect_type, missing_bulk_site_indices, additional_defect_site_indices
 
 
-
 def get_point_defect_types_and_site_indices(
     defect_supercell: Structure,
     bulk_supercell: Structure,
@@ -745,8 +745,8 @@ def get_point_defect_types_and_site_indices(
             and bulk structures. If ``abs_tol`` is ``False`` (default), then
             the distance threshold for matching is set to the product of
             ``site_tol`` and the shortest bond length in the bulk structure for
-            the species at the bulk site, otherwise the value is used directly 
-            (as a length in Å). Default is 0.5 (i.e. half the shortest bond 
+            the species at the bulk site, otherwise the value is used directly
+            (as a length in Å). Default is 0.5 (i.e. half the shortest bond
             length in the bulk structure for the species at a bulk site).
         abs_tol (bool):
             Whether to use ``site_tol`` as an absolute distance tolerance (in
@@ -765,7 +765,7 @@ def get_point_defect_types_and_site_indices(
 
     Returns:
         point_defects (list[tuple[str, int, int]]):
-            A list of tuples representing the point defects found, where each 
+            A list of tuples representing the point defects found, where each
             tuple contains:
             - The type of defect (``interstitial``, ``vacancy``, or ``substitution``).
             - The index of the site in the bulk structure (or None for interstitials).
@@ -824,10 +824,11 @@ def get_point_defect_types_and_site_indices(
         for mapping in defect_site_mappings:
             if mapping[1] is not None:  # missing bulk site
                 missing_bulk_site_indices.append(mapping[1])
-                bulk_dist_tols[mapping[1]] = site_dist_tol # record tolerance for this site
+                bulk_dist_tols[mapping[1]] = site_dist_tol  # record tolerance for this site
             if mapping[2] is not None:  # additional defect site (may be from same matched tuple if dist
                 additional_defect_site_indices.append(mapping[2])  # greater than site_dist_tol)
 
+    # get mapping of missing bulk sites to additional defect sites to determine if they are substitutions
     unmatched_site_mapping = _get_site_mapping_from_coords_and_indices(
         bulk_supercell.frac_coords[missing_bulk_site_indices],
         defect_supercell.frac_coords[additional_defect_site_indices],
@@ -835,12 +836,20 @@ def get_point_defect_types_and_site_indices(
         s1_indices=missing_bulk_site_indices,
         s2_indices=additional_defect_site_indices,
         use_rms=use_rms,
-    ) # get mapping of missing bulk sites to additional defect sites to determine if they are substitutions
+    )
 
     point_defects = []
     for dist, bulk_idx, defect_idx in unmatched_site_mapping:
-        sub_dist_tol = bulk_dist_tols.get(bulk_idx)  # tolerance for this missing bulk site (None if no site)
-        if bulk_idx is not None and defect_idx is not None and dist is not None and sub_dist_tol is not None and dist <= sub_dist_tol:
+        sub_dist_tol = bulk_dist_tols.get(
+            bulk_idx
+        )  # tolerance for this missing bulk site (None if no site)
+        if (
+            bulk_idx is not None
+            and defect_idx is not None
+            and dist is not None
+            and sub_dist_tol is not None
+            and dist <= sub_dist_tol
+        ):
             point_defects.append(("substitution", bulk_idx, defect_idx))
         else:
             if bulk_idx is not None:
@@ -849,7 +858,7 @@ def get_point_defect_types_and_site_indices(
                 point_defects.append(("interstitial", None, defect_idx))
 
     return point_defects
-    
+
 
 def get_coords_and_idx_of_species(
     structure_or_sites: SiteCollection,
