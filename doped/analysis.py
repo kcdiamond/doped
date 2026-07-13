@@ -27,10 +27,7 @@ from pymatgen.io.vasp.outputs import Procar, Vasprun
 from pymatgen.util.typing import PathLike
 from tqdm import tqdm
 
-from doped.complexes import (
-    _get_transformation_to_primitive,
-    get_equivalent_complex_defect_sites_in_primitive,
-)
+from doped.complexes import get_equivalent_complex_defect_sites_in_primitive
 from doped.core import Defect, DefectComplex, DefectEntry, guess_and_set_oxi_states_with_timeout
 from doped.generation import (
     get_defect_name_from_defect,
@@ -46,6 +43,7 @@ from doped.utils import (
     get_mp_context,
     pool_manager,
 )
+from doped.utils.configurations import get_transformation_from_s2_to_s1
 from doped.utils.efficiency import StructureMatcher_scan_stol, _parse_site_species_str
 from doped.utils.parsing import (
     _CALC_OUTPUT_MASK,
@@ -674,9 +672,7 @@ def defect_complex_from_structures(
     defect_site_centroids = []
     for equiv_complex in equiv_complexes_in_prim:
         anchor_site = equiv_complex[0]
-        defect_site_centroid = np.mean(
-            [site.frac_coords + anchor_site.distance_and_image(site)[1] for site in equiv_complex], axis=0
-        )
+        defect_site_centroid = np.mean([site.frac_coords for site in equiv_complex], axis=0)
 
         # centre complexes to unit cell
         # TODO: could this be done in the get_equivalent_complexes function beforehand?
@@ -693,8 +689,18 @@ def defect_complex_from_structures(
         [(site.frac_coords + anchor_site.distance_and_image(site)[1]) for site in defect_obj_sites], axis=0
     )
 
-    aligned_prim, sc_matrix, offset = _get_transformation_to_primitive(primitive_structure, bulk_supercell)
-    # TODO: pass through tolerance kwargs?
+    # get transformation to primitive
+    sm_kwargs = {
+        k: v
+        for k, v in kwargs.items()
+        if k in ["ltol", "stol", "angle_tol", "min_stol", "max_stol", "stol_factor", "comparator"]
+    }
+    sc_matrix, trans_vector, _mapping = get_transformation_from_s2_to_s1(
+        bulk_supercell, primitive_structure, attempt_supercell=True, scale=False, **sm_kwargs
+    )
+    sc_matrix = np.asarray(sc_matrix)
+    offset = -np.asarray(trans_vector) @ sc_matrix
+    offset -= np.floor(offset)  # wrap into [0, 1) (?)
 
     # GENERATE POINT DEFECT OBJECTS
     point_defects = []
@@ -744,7 +750,7 @@ def defect_complex_from_structures(
                 defect_site_in_prim.frac_coords = bulk_site_in_prim.frac_coords
 
             # snap site for Defect object site to site in bulk but in correct (non-unit) cell
-            matched_prim_site = get_matching_site(rel_defect_obj_site_fc, aligned_prim)
+            matched_prim_site = get_matching_site(rel_defect_obj_site_fc, primitive_structure)
             rel_lattice_vector = np.rint(rel_defect_obj_site_fc - matched_prim_site.frac_coords)
             rel_defect_obj_site_fc = matched_prim_site.frac_coords + rel_lattice_vector
 

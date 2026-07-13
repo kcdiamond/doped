@@ -5,6 +5,7 @@ Code for generating and analysing defect complexes.
 import contextlib
 import math
 import warnings
+from collections import Counter
 from collections.abc import Iterable
 from copy import deepcopy
 from functools import lru_cache
@@ -14,6 +15,9 @@ from typing import TYPE_CHECKING, Any, cast
 import numpy as np
 from pymatgen.analysis.ewald import EwaldMinimizer, EwaldSummation
 from pymatgen.analysis.molecule_matcher import BruteForceOrderMatcher
+from pymatgen.core.lattice import Lattice
+from pymatgen.core.operations import SymmOp
+from pymatgen.core.structure_matcher import get_linear_assignment_solution
 from pymatgen.util.coord import get_angle, pbc_shortest_vectors
 from tqdm import tqdm
 
@@ -26,7 +30,7 @@ from doped.utils.parsing import (
     get_matching_site,
 )
 from doped.utils.symmetry import (
-    _rotate_and_get_supercell_matrix,
+    _get_sga,
     get_distance_matrix,
     get_equiv_frac_coords_in_primitive,
     get_primitive_structure,
@@ -1229,36 +1233,156 @@ def get_split_vacancies_from_database(*args, verbose: bool | str = False):
     raise NotImplementedError("Not implemented yet.")
 
 
-def _get_transformation_to_primitive(
-    prim_struct: Structure,
-    sc_struct: Structure,
-    ltol: float = 1e-5,
-    atol: float = 1,
-) -> tuple[Structure, np.ndarray, np.ndarray]:
-    """Get the actual transformation from the supercell to the primitive structure,
-    i.e. matrix M and fc shift c such that prim_fc = sc_fc @ M + c.
+def get_standard_complex(
+    point_defects: list[tuple[str, np.ndarray]],
+    return_sort_index: bool = False,
+    prec: int | None = None,
+) -> list[tuple[str, np.ndarray]] | tuple[list[tuple[str, np.ndarray]], list[int]]:
     """
-    aligned_prim, sc_matrix = _rotate_and_get_supercell_matrix(
-        prim_struct, sc_struct, ltol=ltol, atol=atol
-    )
-    if aligned_prim is None or sc_matrix is None:
-        raise ValueError("Couldn't get transformation to primitive")
+    Get a standardised representation of a defect complex.
 
-    # TODO: draft structure match
-    struct_in_prim_lattice = sc_struct.frac_coords @ sc_matrix
-    ref_in_prim_lattice = struct_in_prim_lattice[0]
-    ref_symbol = sc_struct[0].specie.symbol
-    sc_symbols = np.array([site.specie.symbol for site in sc_struct])
-    prim_symbols = np.array([site.specie.symbol for site in aligned_prim])
-    species_match = sc_symbols[:, None] == prim_symbols[None, :]
+    The fractional coordinates of the constituent point defects are
+    translated (by an integer number of lattice vectors) so that the
+    centroid of the complex lies within the primitive cell, and the point
+    defects are then sorted to give a reproducible ordering. This provides a
+    canonical representation which can be compared to identify equivalent
+    complexes.
 
-    for prim_idx, prim_site in enumerate(aligned_prim):
-        if prim_symbols[prim_idx] == ref_symbol:
-            candidate_offset = prim_site.frac_coords - ref_in_prim_lattice
-            dists = aligned_prim.lattice.get_all_distances(
-                struct_in_prim_lattice + candidate_offset, aligned_prim.frac_coords
-            )
-            if np.all(np.where(species_match, dists, np.inf).min(axis=1) < 0.1):
-                return aligned_prim, sc_matrix, candidate_offset
+    Args:
+        point_defects (list[tuple[str, np.ndarray]]):
+            List of tuples describing the point defects which make up the
+            complex, each being a label (``str``) and the fractional
+            coordinates (``np.ndarray``) of that point defect in the
+            primitive structure.
+        prec (int):
+            Number of decimal places to round the fractional coordinates to,
+            before determining the standard representation.
+            (Default: None - no rounding)
+        return_sort_index (bool):
+            If ``True``, also return the list of indices which sorts
+            ``point_defects`` into the standard ordering. This can be used to
+            reorder any additional data aligned with ``point_defects`` (i.e.
+            ``[data[i] for i in sort_index]``) into the same ordering.
+            (Default: False)
 
-    raise ValueError("Couldn't get transformation to primitive")
+    Returns (list[tuple[str, np.ndarray]] | list[int]]):
+        The input list of point-defect tuples, with fractional coordinates
+        translated so the complex centroid lies within the primitive cell,
+        and sorted by label then coordinates. If ``return_sort_index`` is
+        ``True``, the indices which sort the input ``point_defects`` into the
+        standard ordering are also returned, as ``(standard_complex,
+        sort_index)``.
+    """
+    labels, site_fcs = zip(*point_defects, strict=False)
+
+    # round
+    if prec is not None:
+        site_fcs = np.round(site_fcs, prec)
+
+    # map centroid to primitive
+    centroid = np.mean(site_fcs, axis=0)
+    site_fcs += -np.floor(centroid)
+
+    # sort by label, then coords (the coordinate array is cast to a tuple so
+    # that the sort keys are unambiguously comparable)
+    sort_index = sorted(range(len(labels)), key=lambda i: (labels[i], tuple(site_fcs[i])))
+    standard_complex = [(labels[i], site_fcs[i]) for i in sort_index]
+
+    if return_sort_index:
+        return standard_complex, sort_index
+    return standard_complex
+
+
+def check_equivalent_complexes(
+    complex_1: list[tuple[str, np.ndarray]],
+    complex_2: list[tuple[str, np.ndarray]],
+    lattice: Lattice,
+    dist_tol: float = 0.01,
+) -> bool:
+    """
+    Determine whether two defect complexes are equivalent.
+
+    Two complexes are equivalent if they are composed of the same multiset of
+    point-defect labels, and the constituent point defects of each label can be
+    paired up between the two complexes such that every pair coincides to within
+    ``dist_tol`` (in Å).
+
+    For each label, the point defects are optimally paired between the two
+    complexes using linear-sum assignment on the distance matrix, and the
+    complexes are equivalent only if every paired point defect lies within
+    ``dist_tol`` of its match.
+
+    The fractional coordinates are assumed to be correctly unwrapped (a complex
+    may span more than one primitive cell), so plain Euclidean distances are
+    used, *without* applying periodic boundary conditions. ``lattice`` is used
+    only to convert the fractional coordinates to Cartesian, so that ``dist_tol``
+    is applied in Å.
+
+    Complexes related by an integer lattice translation are treated as
+    equivalent: ``complex_2`` is first translated by the integer lattice vector
+    which aligns its centroid with that of ``complex_1``. This does not account
+    for symmetry-equivalence of complexes related by a (non-translation)
+    symmetry operation of the host structure (see
+    ``get_complex_orbit_and_stabiliser`` for that).
+
+    Args:
+        complex_1 (list[tuple[str, np.ndarray]]):
+            First defect complex, as a list of ``(label, fractional
+            coordinates)`` tuples for its constituent point defects.
+        complex_2 (list[tuple[str, np.ndarray]]):
+            Second defect complex, in the same format as ``complex_1``.
+        lattice (|Lattice|):
+            Lattice of the (primitive) structure in which the point-defect
+            fractional coordinates are defined, used to convert them to
+            Cartesian coordinates (so that ``dist_tol`` is applied in Å).
+        dist_tol (float):
+            Distance tolerance (in Å) within which paired point defects are
+            taken to coincide.
+            (Default: 0.01)
+
+    Returns:
+        bool:
+            ``True`` if the two complexes are equivalent, else ``False``.
+    """
+    labels_1, fcs_1 = zip(*complex_1, strict=False)
+    labels_2, fcs_2 = zip(*complex_2, strict=False)
+    if Counter(labels_1) != Counter(labels_2):  # different compositions
+        return False
+
+    # match centres by integer lattice vector
+    centroid_1 = np.mean(fcs_1, axis=0)
+    centroid_2 = np.mean(fcs_2, axis=0)
+    int_shift = np.round(centroid_1 - centroid_2)
+
+    # false if not integer lattice vector
+    centroid_diff = lattice.get_cartesian_coords(centroid_1 - centroid_2 - int_shift)
+    if np.linalg.norm(centroid_diff) > dist_tol:
+        return False
+
+    # check each label for match
+    for label in set(labels_1):
+        cart_1 = lattice.get_cartesian_coords([fc for lbl, fc in complex_1 if lbl == label])
+        cart_2 = lattice.get_cartesian_coords([fc + int_shift for lbl, fc in complex_2 if lbl == label])
+        cart_dists = np.linalg.norm(cart_1[:, None, :] - cart_2[None, :, :], axis=-1)
+        matches, _ = get_linear_assignment_solution(cart_dists)
+        if np.any(cart_dists[np.arange(len(matches)), matches] > dist_tol):
+            return False
+
+    return True
+
+
+def get_complex_orbit_and_stabiliser(
+    point_defects: list[tuple[str, np.ndarray]],
+    primitive: Structure,
+    quotient_ops: list[SymmOp] | None = None,
+    symprec: float = 0.01,
+) -> tuple[list[PeriodicSite], list[SymmOp]]:
+    """
+    Args:
+        point_defects: List of labels and frac coords in primitive structure.
+    """
+    if quotient_ops is None:
+        quotient_ops = _get_sga(primitive, symprec=symprec)
+
+    labels, site_fcs = zip(*point_defects, strict=False)
+    # TODO WIP
