@@ -27,7 +27,7 @@ from pymatgen.io.vasp.outputs import Procar, Vasprun
 from pymatgen.util.typing import PathLike
 from tqdm import tqdm
 
-from doped.complexes import get_equivalent_complex_defect_sites_in_primitive
+from doped.complexes import get_complex_orbit_and_stabiliser
 from doped.core import Defect, DefectComplex, DefectEntry, guess_and_set_oxi_states_with_timeout
 from doped.generation import (
     get_defect_name_from_defect,
@@ -496,8 +496,8 @@ def defect_complex_from_structures(
     **kwargs,
 ) -> Defect | tuple[Defect, PeriodicSite, PeriodicSite, int | None, int | None, Structure, Structure]:
     """
-    Auto-determines the defect types and defect sites from the supplied bulk and
-    defect structures, and returns the corresponding |Defect| object with
+    Auto-determines the defect types and defect sites from the supplied bulk
+    and defect structures, and returns the corresponding |Defect| object with
     the defect sites in the primitive structure.
 
     Note that this assumes consistent cell definitions (lattice vectors and
@@ -628,29 +628,11 @@ def defect_complex_from_structures(
 
     primitive_structure = get_primitive_structure(bulk_supercell, symprec=kwargs.get("symprec") or 0.01)
 
-    # GET EQUIVALENT COMPLEX SITES AND CENTROID SITES
-    # TODO: does this have to be done after snapping
-
-    defect_obj_sites = [
+    defect_obj_sites_sc = [
         defect_site if defect_type == "interstitial" else defect_site_in_bulk
         for defect_site, defect_type, defect_site_in_bulk in zip(
             defect_sites, defect_types, defect_sites_in_bulk
         )
-    ]
-    vacancy_sites = [
-        defect_obj_site
-        for defect_obj_site, defect_type in zip(defect_obj_sites, defect_types)
-        if defect_type == "vacancy"
-    ]
-    interstitial_sites = [
-        defect_obj_site
-        for defect_obj_site, defect_type in zip(defect_obj_sites, defect_types)
-        if defect_type == "interstitial"
-    ]
-    substitution_sites = [
-        defect_obj_site
-        for defect_obj_site, defect_type in zip(defect_obj_sites, defect_types)
-        if defect_type == "substitution"
     ]
 
     equiv_kwargs = {
@@ -659,34 +641,13 @@ def defect_complex_from_structures(
         if k in ["symprec", "dist_tol_factor", "fixed_symprec_and_dist_tol_factor", "verbose"]
     }
 
-    equiv_complexes_in_prim = get_equivalent_complex_defect_sites_in_primitive(
-        bulk_supercell,
-        vacancy_sites,
-        interstitial_sites,
-        substitution_sites,
-        primitive_structure,
-        **equiv_kwargs,
-    )  # equiv_coords=True, return_symprec_and_dist_tol_factor=False (default)
-
-    # get pbc aware defect sites centroids
-    defect_site_centroids = []
-    for equiv_complex in equiv_complexes_in_prim:
-        anchor_site = equiv_complex[0]
-        defect_site_centroid = np.mean([site.frac_coords for site in equiv_complex], axis=0)
-
-        # centre complexes to unit cell
-        # TODO: could this be done in the get_equivalent_complexes function beforehand?
-        for defect_site in equiv_complex:
-            defect_site.frac_coords = defect_site.frac_coords - np.floor(defect_site_centroid)
-
-        defect_site_centroids.append(defect_site_centroid % 1)
-
     # TRANSFORM SUPERCELL TO PRIMITIVE CELL
 
     # get centroid
-    anchor_site = defect_obj_sites[0]
+    anchor_site = defect_obj_sites_sc[0]
     defect_obj_site_centroid = np.mean(
-        [(site.frac_coords + anchor_site.distance_and_image(site)[1]) for site in defect_obj_sites], axis=0
+        [(site.frac_coords + anchor_site.distance_and_image(site)[1]) for site in defect_obj_sites_sc],
+        axis=0,
     )
 
     # get transformation to primitive
@@ -704,6 +665,7 @@ def defect_complex_from_structures(
 
     # GENERATE POINT DEFECT OBJECTS
     point_defects = []
+    defect_obj_rel_sites = []
     all_info = []
     for defect_idx, defect_site_info in enumerate(defect_sites_info):
         (
@@ -716,14 +678,16 @@ def defect_complex_from_structures(
             unrelaxed_defect_structure,
         ) = defect_site_info
 
-        point_def_site = defect_obj_sites[defect_idx]
-        pbc_sc_fc = point_def_site.frac_coords + defect_obj_sites[0].distance_and_image(point_def_site)[1]
+        point_def_site = defect_obj_sites_sc[defect_idx]
+        pbc_sc_fc = (
+            point_def_site.frac_coords + defect_obj_sites_sc[0].distance_and_image(point_def_site)[1]
+        )
 
         rel_defect_obj_site_fc = pbc_sc_fc @ sc_matrix + offset
 
         # get defect site in primitive structure, for Defect generation:
         equiv_frac_coords_in_prim = get_equiv_frac_coords_in_primitive(
-            frac_coords=defect_obj_sites[defect_idx].frac_coords,
+            frac_coords=defect_obj_sites_sc[defect_idx].frac_coords,
             primitive=primitive_structure,
             supercell=bulk_supercell,
             **equiv_kwargs,
@@ -755,11 +719,12 @@ def defect_complex_from_structures(
             rel_defect_obj_site_fc = matched_prim_site.frac_coords + rel_lattice_vector
 
         defect_obj_site = PeriodicSite(
-            defect_obj_sites[defect_idx].species,
+            defect_obj_sites_sc[defect_idx].species,
             rel_defect_obj_site_fc,
             primitive_structure.lattice,
             coords_are_cartesian=False,
         )
+        defect_obj_rel_sites.append(defect_obj_site)
 
         # drop unsupported Defect() kwargs for non-interstitial defects
         defect_init_kwargs = (
@@ -801,7 +766,22 @@ def defect_complex_from_structures(
                 )
             )
 
-    complex_defect = DefectComplex(point_defects, equivalent_complexes=equiv_complexes_in_prim)
+    # GET EQUIVALENT COMPLEXES
+
+    # get equivalent complexes
+    orbit, stabiliser = get_complex_orbit_and_stabiliser(
+        defect_obj_rel_sites,
+        primitive_structure,
+    )  # TODO kwargs
+
+    # centre all equivalent complexes to unit cell
+    # TODO could this be done in get_complex_orbit_and_stabiliser
+    for orb_element in orbit:
+        defect_site_centroid = np.mean([site.frac_coords for site in orb_element], axis=0)
+        for defect_site in orb_element:
+            defect_site.frac_coords = defect_site.frac_coords - np.floor(defect_site_centroid)
+
+    complex_defect = DefectComplex(point_defects, equivalent_complexes=orbit)
 
     if not return_all_info:
         return complex_defect

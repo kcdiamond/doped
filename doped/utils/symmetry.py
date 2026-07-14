@@ -4475,6 +4475,9 @@ def get_orientational_degeneracy(
     )
 
 
+# TODO: bugs in this function?
+# same_image = False allows many-to-one mappings
+# same_image = True also seems to fail if multiple sites equal mod 1
 def is_periodic_image(
     sites_1: Iterable[PeriodicSite | np.ndarray],
     sites_2: Iterable[PeriodicSite | np.ndarray],

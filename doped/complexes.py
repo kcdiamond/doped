@@ -15,10 +15,10 @@ from typing import TYPE_CHECKING, Any, cast
 import numpy as np
 from pymatgen.analysis.ewald import EwaldMinimizer, EwaldSummation
 from pymatgen.analysis.molecule_matcher import BruteForceOrderMatcher
-from pymatgen.core.lattice import Lattice
 from pymatgen.core.operations import SymmOp
 from pymatgen.core.structure_matcher import get_linear_assignment_solution
 from pymatgen.util.coord import get_angle, pbc_shortest_vectors
+from spglib import get_pointgroup
 from tqdm import tqdm
 
 from doped.core import _get_oxi_state_modes, guess_and_set_oxi_states_with_timeout
@@ -30,11 +30,13 @@ from doped.utils.parsing import (
     get_matching_site,
 )
 from doped.utils.symmetry import (
-    _get_sga,
+    apply_symm_op_to_site,
     get_distance_matrix,
     get_equiv_frac_coords_in_primitive,
     get_primitive_structure,
+    get_sga,
     is_periodic_image,
+    schoenflies_from_hermann,
 )
 
 if TYPE_CHECKING:
@@ -1294,47 +1296,22 @@ def get_standard_complex(
 
 
 def check_equivalent_complexes(
-    complex_1: list[tuple[str, np.ndarray]],
-    complex_2: list[tuple[str, np.ndarray]],
-    lattice: Lattice,
+    complex_1: list[PeriodicSite],
+    complex_2: list[PeriodicSite],
     dist_tol: float = 0.01,
+    wout_charge: bool = False,
 ) -> bool:
-    """
-    Determine whether two defect complexes are equivalent.
-
-    Two complexes are equivalent if they are composed of the same multiset of
-    point-defect labels, and the constituent point defects of each label can be
-    paired up between the two complexes such that every pair coincides to within
-    ``dist_tol`` (in Å).
-
-    For each label, the point defects are optimally paired between the two
-    complexes using linear-sum assignment on the distance matrix, and the
-    complexes are equivalent only if every paired point defect lies within
-    ``dist_tol`` of its match.
-
-    The fractional coordinates are assumed to be correctly unwrapped (a complex
-    may span more than one primitive cell), so plain Euclidean distances are
-    used, *without* applying periodic boundary conditions. ``lattice`` is used
-    only to convert the fractional coordinates to Cartesian, so that ``dist_tol``
-    is applied in Å.
-
-    Complexes related by an integer lattice translation are treated as
-    equivalent: ``complex_2`` is first translated by the integer lattice vector
-    which aligns its centroid with that of ``complex_1``. This does not account
-    for symmetry-equivalence of complexes related by a (non-translation)
-    symmetry operation of the host structure (see
-    ``get_complex_orbit_and_stabiliser`` for that).
+    r"""
+    Determine whether two defect complexes are equal, up to a rigid integer
+    lattice vector translation, and within dist_tol. Accepts a list of
+    PeriodicSite objects in any order. Plain Euclidean match, no periodic
+    boundary conditions.
 
     Args:
-        complex_1 (list[tuple[str, np.ndarray]]):
-            First defect complex, as a list of ``(label, fractional
-            coordinates)`` tuples for its constituent point defects.
-        complex_2 (list[tuple[str, np.ndarray]]):
+        complex_1 (list[PeriodicSite]):
+            First defect complex, as a list of |PeriodicSite|\\s.
+        complex_2 (list[PeriodicSite]):
             Second defect complex, in the same format as ``complex_1``.
-        lattice (|Lattice|):
-            Lattice of the (primitive) structure in which the point-defect
-            fractional coordinates are defined, used to convert them to
-            Cartesian coordinates (so that ``dist_tol`` is applied in Å).
         dist_tol (float):
             Distance tolerance (in Å) within which paired point defects are
             taken to coincide.
@@ -1344,10 +1321,14 @@ def check_equivalent_complexes(
         bool:
             ``True`` if the two complexes are equivalent, else ``False``.
     """
-    labels_1, fcs_1 = zip(*complex_1, strict=False)
-    labels_2, fcs_2 = zip(*complex_2, strict=False)
+    labels_1 = [site.species_string for site in complex_1]
+    labels_2 = [site.species_string for site in complex_2]
     if Counter(labels_1) != Counter(labels_2):  # different compositions
         return False
+
+    lattice = complex_1[0].lattice
+    fcs_1 = [site.frac_coords for site in complex_1]
+    fcs_2 = [site.frac_coords for site in complex_2]
 
     # match centres by integer lattice vector
     centroid_1 = np.mean(fcs_1, axis=0)
@@ -1361,8 +1342,12 @@ def check_equivalent_complexes(
 
     # check each label for match
     for label in set(labels_1):
-        cart_1 = lattice.get_cartesian_coords([fc for lbl, fc in complex_1 if lbl == label])
-        cart_2 = lattice.get_cartesian_coords([fc + int_shift for lbl, fc in complex_2 if lbl == label])
+        cart_1 = lattice.get_cartesian_coords(
+            [fc for lbl, fc in zip(labels_1, fcs_1, strict=True) if lbl == label]
+        )
+        cart_2 = lattice.get_cartesian_coords(
+            [fc + int_shift for lbl, fc in zip(labels_2, fcs_2, strict=True) if lbl == label]
+        )
         cart_dists = np.linalg.norm(cart_1[:, None, :] - cart_2[None, :, :], axis=-1)
         matches, _ = get_linear_assignment_solution(cart_dists)
         if np.any(cart_dists[np.arange(len(matches)), matches] > dist_tol):
@@ -1371,18 +1356,66 @@ def check_equivalent_complexes(
     return True
 
 
+# TODO efficiency?
 def get_complex_orbit_and_stabiliser(
-    point_defects: list[tuple[str, np.ndarray]],
+    point_defects: list[PeriodicSite],
     primitive: Structure,
     quotient_ops: list[SymmOp] | None = None,
-    symprec: float = 0.01,
-) -> tuple[list[PeriodicSite], list[SymmOp]]:
+    symprec: float = 0.01,  # TODO tolerances? use get_sga_and_symprec?
+    dist_tol: float = 0.01,
+    give_point_group: bool = False,
+) -> tuple[list[list[PeriodicSite]], list[SymmOp]] | tuple[list[list[PeriodicSite]], list[SymmOp], str]:
     """
+    Get the orbit and stabiliser of a defect complex, given a primitive
+    structure.
+
     Args:
-        point_defects: List of labels and frac coords in primitive structure.
+        point_defects (list[PeriodicSite]):
+            Constituent point defects of the complex, defined in primitive frame.
+        primitive (|Structure|):
+            Primitive host structure.
+        quotient_ops (list[SymmOp] | None):
+            Sapce group symmetry operations, in fractional coordinates,
+            to test. If ``None``, determined from ``primitive``.
+        symprec (float):
+            Symmetry precision for determining ``quotient_ops`` (if ``None``).
+            (Default: 0.01)
+        dist_tol (float):
+            Distance tolerance (in Å) within which paired point defects are
+            taken to coincide when matching complexes after symmetry. (Default: 0.01)
+        give_point_group (bool):
+            Whether to also return the Schoenflies point group symbol of the
+            complex (i.e. of the stabiliser). (Default: False)
+
+    Returns:
+        tuple[list[list[PeriodicSite]], list[SymmOp]] | tuple[list[list[PeriodicSite]], list[SymmOp], str]:
+            The orbit and stabiliser of the complex in the crystal, per primitive
+            lattice cell. If ``give_point_group`` is ``True``, the Schoenflies
+            point group symbol of the complex is also returned as a third element.
     """
     if quotient_ops is None:
-        quotient_ops = _get_sga(primitive, symprec=symprec)
+        quotient_ops = get_sga(primitive, symprec=symprec).get_symmetry_operations()
 
-    labels, site_fcs = zip(*point_defects, strict=False)
-    # TODO WIP
+    stabiliser = []
+    orbit = [point_defects]
+
+    for operation in quotient_ops:
+        new_complex = [
+            apply_symm_op_to_site(operation, site, rotate_lattice=False, fractional=True)
+            for site in point_defects
+        ]  # TODO: apply centring here?
+        if check_equivalent_complexes(point_defects, new_complex, dist_tol=dist_tol):
+            stabiliser.append(operation)
+        elif not any(
+            check_equivalent_complexes(orb_elem, new_complex, dist_tol=dist_tol) for orb_elem in orbit
+        ):
+            orbit.append(new_complex)
+
+    if give_point_group:
+        rotations = [np.rint(op.rotation_matrix).astype(int) for op in stabiliser]
+        if (pointgroup := get_pointgroup(rotations)) is None:
+            raise RuntimeError("Could not determine the point group of the defect complex stabiliser.")
+        hermann_symbol, _number, _transform = pointgroup
+        return orbit, stabiliser, schoenflies_from_hermann(hermann_symbol.strip())
+
+    return orbit, stabiliser
