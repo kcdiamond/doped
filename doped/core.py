@@ -3196,7 +3196,7 @@ class Interstitial(Defect, core.Interstitial):
 class DefectComplex(core.DefectComplex, Defect):
     def __init__(
         self,
-        defects: list[list[Defect]],
+        defects: list[Defect],
         oxi_state: float | str | None = None,
         equivalent_complexes: list[PeriodicSite] | None = None,
         **doped_kwargs,
@@ -3224,9 +3224,16 @@ class DefectComplex(core.DefectComplex, Defect):
 
         # TODO: map to unit cell consistently
 
-    def get_multiplicity(self, **kwargs) -> int:
+    def get_multiplicity(
+        self,
+        primitive_structure: Structure | None = None,
+        symprec: float | None = None,
+        dist_tol_factor: float = 1.0,
+        **kwargs,
+    ) -> int:
         """
-        Temporary multiplicity of the defect complex to override core.DefectComplex.
+        Temporary multiplicity of the defect complex to override
+        core.DefectComplex.
         """
         if self.equivalent_complexes is not None:
             return len(self.equivalent_complexes)

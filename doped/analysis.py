@@ -75,6 +75,7 @@ from doped.utils.parsing import (
     total_charge_from_vasprun,
 )
 from doped.utils.plotting import format_defect_name
+from doped.utils.supercells import get_min_image_distance
 from doped.utils.symmetry import (
     _frac_coords_sort_func,
     get_equiv_frac_coords_in_primitive,
@@ -324,7 +325,10 @@ def defect_sites_from_structures(
     _parameter_order_warn: bool = True,
 ) -> (
     list[PeriodicSite]
-    | list[tuple[PeriodicSite, str, PeriodicSite, int | None, int | None, Structure, Structure]]
+    | tuple[
+        list[PeriodicSite],
+        list[tuple[PeriodicSite, str, PeriodicSite, int | None, int | None, Structure, Structure]],
+    ]
 ):
     """
     Auto-determines the defect sites from the supplied bulk and defect
@@ -494,7 +498,13 @@ def defect_complex_from_structures(
     skip_atom_mapping_check: bool = False,
     _parameter_order_warn: bool = True,
     **kwargs,
-) -> Defect | tuple[Defect, PeriodicSite, PeriodicSite, int | None, int | None, Structure, Structure]:
+) -> (
+    DefectComplex
+    | tuple[
+        DefectComplex,
+        list[tuple[Defect, PeriodicSite, PeriodicSite, int | None, int | None, Structure, Structure]],
+    ]
+):
     """
     Auto-determines the defect types and defect sites from the supplied bulk
     and defect structures, and returns the corresponding |Defect| object with
@@ -590,11 +600,11 @@ def defect_complex_from_structures(
         defect_sites,
         defect_types,
         defect_sites_in_bulk,
-        defect_site_indices,
-        bulk_site_indices,
-        guessed_initial_defect_structures,
-        unrelaxed_defect_structures,
-    ) = zip(*defect_sites_info)
+        _defect_site_indices,
+        _bulk_site_indices,
+        _guessed_initial_defect_structures,
+        _unrelaxed_defect_structures,
+    ) = zip(*defect_sites_info, strict=True)
 
     # TODO: using bulk_site_centroid to check atom mapping? appropriate?
     if not skip_atom_mapping_check:
@@ -626,29 +636,54 @@ def defect_complex_from_structures(
         # in these situations, where there are many possible defect cell translations etc which match the
         # bulk cell...
 
-    primitive_structure = get_primitive_structure(bulk_supercell, symprec=kwargs.get("symprec") or 0.01)
-
+    # define defect object sites
     defect_obj_sites_sc = [
         defect_site if defect_type == "interstitial" else defect_site_in_bulk
         for defect_site, defect_type, defect_site_in_bulk in zip(
-            defect_sites, defect_types, defect_sites_in_bulk, strict=True,
+            defect_sites,
+            defect_types,
+            defect_sites_in_bulk,
+            strict=True,
         )
     ]
+
+    # UNWRAPPING
+
+    # try first unwrapping
+    max_complex_span = get_min_image_distance(bulk_supercell) / 2
+    unwrapped_fc = [
+        def_site.frac_coords + defect_obj_sites_sc[0].distance_and_image(def_site)[1]
+        for def_site in defect_obj_sites_sc
+    ]
+    cart_coords = bulk_supercell.lattice.get_cartesian_coords(unwrapped_fc)
+    complex_span = np.linalg.norm(cart_coords[:, None] - cart_coords, axis=-1).max()
+
+    # if unwrapping is not unique, get best - anchor with smallest max distance to all other points
+    if complex_span >= max_complex_span:
+        for anchor_site in defect_obj_sites_sc[1:]:
+            candidate_fc = [
+                def_site.frac_coords + anchor_site.distance_and_image(def_site)[1]
+                for def_site in defect_obj_sites_sc
+            ]
+            cart_coords = bulk_supercell.lattice.get_cartesian_coords(candidate_fc)
+            candidate_span = np.linalg.norm(cart_coords[:, None] - cart_coords, axis=-1).max()
+            if candidate_span < complex_span:
+                unwrapped_fc, complex_span = candidate_fc, candidate_span
+        warnings.warn(
+            f"The defect complex spans {complex_span:.2f} Å, which is greater than half the min "
+            f"image distance of the supercell ({max_complex_span:.2f} Å). The unwrapped complex "
+            f"may be ambiguous."
+        )
+
+    # TRANSFORM SUPERCELL TO PRIMITIVE CELL
+
+    primitive_structure = get_primitive_structure(bulk_supercell, symprec=kwargs.get("symprec") or 0.01)
 
     equiv_kwargs = {
         k: v
         for k, v in kwargs.items()
         if k in ["symprec", "dist_tol_factor", "fixed_symprec_and_dist_tol_factor", "verbose"]
     }
-
-    # TRANSFORM SUPERCELL TO PRIMITIVE CELL
-
-    # get centroid
-    anchor_site = defect_obj_sites_sc[0]
-    defect_obj_site_centroid = np.mean(
-        [(site.frac_coords + anchor_site.distance_and_image(site)[1]) for site in defect_obj_sites_sc],
-        axis=0,
-    )
 
     # get transformation to primitive
     sm_kwargs = {
@@ -661,9 +696,12 @@ def defect_complex_from_structures(
     )
     sc_matrix = np.asarray(sc_matrix)
     offset = -np.asarray(trans_vector) @ sc_matrix
-    offset -= np.floor(offset)  # wrap into [0, 1) (?)
+
+    # get offset such that centroid lands in unit primitive
+    offset -= np.floor(np.mean(unwrapped_fc, axis=0) @ sc_matrix + offset)
 
     # GENERATE POINT DEFECT OBJECTS
+
     point_defects = []
     defect_obj_rel_sites = []
     all_info = []
@@ -678,12 +716,8 @@ def defect_complex_from_structures(
             unrelaxed_defect_structure,
         ) = defect_site_info
 
-        point_def_site = defect_obj_sites_sc[defect_idx]
-        pbc_sc_fc = (
-            point_def_site.frac_coords + defect_obj_sites_sc[0].distance_and_image(point_def_site)[1]
-        )
-
-        rel_defect_obj_site_fc = pbc_sc_fc @ sc_matrix + offset
+        # transform to primitive
+        rel_defect_obj_site_fc = unwrapped_fc[defect_idx] @ sc_matrix + offset
 
         # get defect site in primitive structure, for Defect generation:
         equiv_frac_coords_in_prim = get_equiv_frac_coords_in_primitive(
@@ -769,11 +803,11 @@ def defect_complex_from_structures(
     # GET EQUIVALENT COMPLEXES
 
     # get equivalent complexes
-    orbit, stabiliser = get_complex_orbit_and_stabiliser(
+    orbit = get_complex_orbit_and_stabiliser(
         defect_obj_rel_sites,
         primitive_structure,
-    )  # TODO kwargs
-    # all equivalent complexes are already centred to the unit cell (by complex centroid)
+    )[0]  # TODO kwargs
+    # TODO do these have to be snapped again...?
 
     complex_defect = DefectComplex(point_defects, equivalent_complexes=orbit)
 

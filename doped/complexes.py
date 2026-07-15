@@ -1298,14 +1298,13 @@ def get_standard_complex(
 def check_equal_complexes(
     complex_1: list[PeriodicSite],
     complex_2: list[PeriodicSite],
-    dist_tol: float = 0.01,
-    wout_charge: bool = False,
+    dist_tol: float = 0.01,  # TODO wout_charge?
 ) -> bool:
     r"""
     Determine whether two defect complexes are equal, up to a rigid integer
     lattice vector translation, and within dist_tol. Accepts a list of
-    PeriodicSite objects in any order. Plain Euclidean match, no periodic
-    boundary conditions.
+    PeriodicSite objects in any order. Plain Euclidean match, no per-site
+    periodic boundary conditions.
 
     Args:
         complex_1 (list[PeriodicSite]):
@@ -1321,7 +1320,7 @@ def check_equal_complexes(
         bool:
             ``True`` if the two complexes are equivalent, else ``False``.
     """
-    return _check_equal_frac_coords(
+    return _check_equal_complex_frac_coords(
         [site.species_string for site in complex_1],
         np.asarray([site.frac_coords for site in complex_1]),
         [site.species_string for site in complex_2],
@@ -1331,7 +1330,7 @@ def check_equal_complexes(
     )
 
 
-def _check_equal_frac_coords(
+def _check_equal_complex_frac_coords(
     labels_1: list[str],
     frac_coords_1: np.ndarray,
     labels_2: list[str],
@@ -1390,6 +1389,7 @@ def _check_equal_frac_coords(
 
     return True
 
+
 # TODO use clustering instead of matching to first
 def get_complex_orbit_and_stabiliser(
     point_defects: list[PeriodicSite],
@@ -1436,10 +1436,10 @@ def get_complex_orbit_and_stabiliser(
         bulk_sga, symprec = get_sga_and_symprec(primitive, symprec)
         quotient_ops = bulk_sga.get_symmetry_operations()
 
-    dist_tol = dist_tol_factor*symprec
+    dist_tol = dist_tol_factor * symprec
     lattice = primitive.lattice
 
-    # get labels and fractional coordinates, and centre the complex (centroid to unit cell)
+    # get labels and fractional coordinates, and centre the complex (centroid to unit primitive)
     point_labels = [site.species_string for site in point_defects]
     point_fcs = np.asarray([site.frac_coords for site in point_defects])
     point_fcs -= np.floor(np.mean(point_fcs, axis=0))
@@ -1448,9 +1448,9 @@ def get_complex_orbit_and_stabiliser(
     rotations = np.array([op.rotation_matrix for op in quotient_ops])  # (n_ops, 3, 3)
     translations = np.array([op.translation_vector for op in quotient_ops])  # (n_ops, 3)
     transformed_fcs = np.einsum("oij,nj->oni", rotations, point_fcs) + translations[:, None, :]
-        # (n_ops, n_sites, 3)
+    # (n_ops, n_sites, 3)
 
-    # centre all elements
+    # centre all complexes to unit primitive
     transformed_fcs -= np.floor(np.mean(transformed_fcs, axis=1, keepdims=True))
 
     stabiliser = []
@@ -1458,19 +1458,27 @@ def get_complex_orbit_and_stabiliser(
 
     # check for matches
     for operation, new_fcs in zip(quotient_ops, transformed_fcs, strict=True):
-        if _check_equal_frac_coords(
+        if _check_equal_complex_frac_coords(
             point_labels, point_fcs, point_labels, new_fcs, lattice, dist_tol=dist_tol
         ):
             stabiliser.append(operation)
         elif not any(
-            _check_equal_frac_coords(
+            _check_equal_complex_frac_coords(
                 point_labels, orb_fcs, point_labels, new_fcs, lattice, dist_tol=dist_tol
             )
             for orb_fcs in fcs_orbit[1:]  # already checked for stabiliser
         ):
             fcs_orbit.append(new_fcs)
 
-    # recreate periodicsites
+    # orbit-stabiliser warning
+    if len(fcs_orbit) * len(stabiliser) != len(quotient_ops):
+        warnings.warn(
+            f"|orbit| ({len(fcs_orbit)}) * |stabiliser| ({len(stabiliser)}) != |G| "
+            f"({len(quotient_ops)}). Check the symmetry tolerances used (symprec = {symprec}, dist_tol "
+            f"= {dist_tol})."
+        )
+
+    # recreate PeriodicSite objects
     orbit = []
     for complex_fcs in fcs_orbit:
         new_sites = []
@@ -1481,8 +1489,8 @@ def get_complex_orbit_and_stabiliser(
         orbit.append(new_sites)
 
     if give_point_group:
-        rotations = [np.rint(op.rotation_matrix).astype(int) for op in stabiliser]
-        if (pointgroup := get_pointgroup(rotations)) is None:
+        pg_ops = [np.rint(op.rotation_matrix).astype(int) for op in stabiliser]
+        if (pointgroup := get_pointgroup(pg_ops)) is None:
             raise RuntimeError("Could not determine the point group of the defect complex stabiliser.")
         hermann_symbol, _number, _transform = pointgroup
         return orbit, stabiliser, schoenflies_from_hermann(hermann_symbol.strip())

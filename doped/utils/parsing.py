@@ -838,11 +838,10 @@ def get_point_defect_types_and_site_indices(
         use_rms=use_rms,
     )
 
-    point_defects = []
+    point_defects: list[tuple[str, int | None, int | None]] = []
     for dist, bulk_idx, defect_idx in unmatched_site_mapping:
-        sub_dist_tol = bulk_dist_tols.get(
-            bulk_idx
-        )  # tolerance for this missing bulk site (None if no site)
+        # tolerance for this missing bulk site (None if no site):
+        sub_dist_tol = bulk_dist_tols.get(bulk_idx) if bulk_idx is not None else None
         if (
             bulk_idx is not None
             and defect_idx is not None
