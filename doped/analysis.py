@@ -631,7 +631,7 @@ def defect_complex_from_structures(
     defect_obj_sites_sc = [
         defect_site if defect_type == "interstitial" else defect_site_in_bulk
         for defect_site, defect_type, defect_site_in_bulk in zip(
-            defect_sites, defect_types, defect_sites_in_bulk
+            defect_sites, defect_types, defect_sites_in_bulk, strict=True,
         )
     ]
 
@@ -773,13 +773,7 @@ def defect_complex_from_structures(
         defect_obj_rel_sites,
         primitive_structure,
     )  # TODO kwargs
-
-    # centre all equivalent complexes to unit cell
-    # TODO could this be done in get_complex_orbit_and_stabiliser
-    for orb_element in orbit:
-        defect_site_centroid = np.mean([site.frac_coords for site in orb_element], axis=0)
-        for defect_site in orb_element:
-            defect_site.frac_coords = defect_site.frac_coords - np.floor(defect_site_centroid)
+    # all equivalent complexes are already centred to the unit cell (by complex centroid)
 
     complex_defect = DefectComplex(point_defects, equivalent_complexes=orbit)
 

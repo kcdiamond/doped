@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, cast
 import numpy as np
 from pymatgen.analysis.ewald import EwaldMinimizer, EwaldSummation
 from pymatgen.analysis.molecule_matcher import BruteForceOrderMatcher
+from pymatgen.core.lattice import Lattice
 from pymatgen.core.operations import SymmOp
 from pymatgen.core.structure_matcher import get_linear_assignment_solution
 from pymatgen.util.coord import get_angle, pbc_shortest_vectors
@@ -30,11 +31,10 @@ from doped.utils.parsing import (
     get_matching_site,
 )
 from doped.utils.symmetry import (
-    apply_symm_op_to_site,
     get_distance_matrix,
     get_equiv_frac_coords_in_primitive,
     get_primitive_structure,
-    get_sga,
+    get_sga_and_symprec,
     is_periodic_image,
     schoenflies_from_hermann,
 )
@@ -1295,7 +1295,7 @@ def get_standard_complex(
     return standard_complex
 
 
-def check_equivalent_complexes(
+def check_equal_complexes(
     complex_1: list[PeriodicSite],
     complex_2: list[PeriodicSite],
     dist_tol: float = 0.01,
@@ -1321,18 +1321,54 @@ def check_equivalent_complexes(
         bool:
             ``True`` if the two complexes are equivalent, else ``False``.
     """
-    labels_1 = [site.species_string for site in complex_1]
-    labels_2 = [site.species_string for site in complex_2]
+    return _check_equal_frac_coords(
+        [site.species_string for site in complex_1],
+        np.asarray([site.frac_coords for site in complex_1]),
+        [site.species_string for site in complex_2],
+        np.asarray([site.frac_coords for site in complex_2]),
+        complex_1[0].lattice,
+        dist_tol=dist_tol,
+    )
+
+
+def _check_equal_frac_coords(
+    labels_1: list[str],
+    frac_coords_1: np.ndarray,
+    labels_2: list[str],
+    frac_coords_2: np.ndarray,
+    lattice: Lattice,
+    dist_tol: float = 0.01,
+) -> bool:
+    """
+    See check_equal_complexes, but for frac_coords and labels without
+    PeriodicSite objects.
+
+    Args:
+        labels_1 (list[str]):
+            Labels (e.g. species strings) of the point defects in the first
+            complex.
+        frac_coords_1 (np.ndarray):
+            Fractional coordinates of the point defects in the first complex.
+        labels_2 (list[str]):
+            Labels of the point defects in the second complex.
+        frac_coords_2 (np.ndarray):
+            Fractional coordinates of the point defects in the second complex.
+        lattice (|Lattice|):
+            Lattice to which the fractional coordinates correspond.
+        dist_tol (float):
+            Distance tolerance (in Å) within which paired point defects are
+            taken to coincide. (Default: 0.01)
+
+    Returns:
+        bool:
+            ``True`` if the two complexes are equivalent, else ``False``.
+    """
     if Counter(labels_1) != Counter(labels_2):  # different compositions
         return False
 
-    lattice = complex_1[0].lattice
-    fcs_1 = [site.frac_coords for site in complex_1]
-    fcs_2 = [site.frac_coords for site in complex_2]
-
     # match centres by integer lattice vector
-    centroid_1 = np.mean(fcs_1, axis=0)
-    centroid_2 = np.mean(fcs_2, axis=0)
+    centroid_1 = np.mean(frac_coords_1, axis=0)
+    centroid_2 = np.mean(frac_coords_2, axis=0)
     int_shift = np.round(centroid_1 - centroid_2)
 
     # false if not integer lattice vector
@@ -1340,14 +1376,13 @@ def check_equivalent_complexes(
     if np.linalg.norm(centroid_diff) > dist_tol:
         return False
 
+    labels_arr_1 = np.asarray(labels_1)
+    labels_arr_2 = np.asarray(labels_2)
+
     # check each label for match
     for label in set(labels_1):
-        cart_1 = lattice.get_cartesian_coords(
-            [fc for lbl, fc in zip(labels_1, fcs_1, strict=True) if lbl == label]
-        )
-        cart_2 = lattice.get_cartesian_coords(
-            [fc + int_shift for lbl, fc in zip(labels_2, fcs_2, strict=True) if lbl == label]
-        )
+        cart_1 = lattice.get_cartesian_coords(frac_coords_1[labels_arr_1 == label])
+        cart_2 = lattice.get_cartesian_coords(frac_coords_2[labels_arr_2 == label] + int_shift)
         cart_dists = np.linalg.norm(cart_1[:, None, :] - cart_2[None, :, :], axis=-1)
         matches, _ = get_linear_assignment_solution(cart_dists)
         if np.any(cart_dists[np.arange(len(matches)), matches] > dist_tol):
@@ -1355,14 +1390,13 @@ def check_equivalent_complexes(
 
     return True
 
-
-# TODO efficiency?
+# TODO use clustering instead of matching to first
 def get_complex_orbit_and_stabiliser(
     point_defects: list[PeriodicSite],
     primitive: Structure,
     quotient_ops: list[SymmOp] | None = None,
-    symprec: float = 0.01,  # TODO tolerances? use get_sga_and_symprec?
-    dist_tol: float = 0.01,
+    symprec: float = 0.01,
+    dist_tol_factor: float = 1.0,
     give_point_group: bool = False,
 ) -> tuple[list[list[PeriodicSite]], list[SymmOp]] | tuple[list[list[PeriodicSite]], list[SymmOp], str]:
     """
@@ -1375,14 +1409,16 @@ def get_complex_orbit_and_stabiliser(
         primitive (|Structure|):
             Primitive host structure.
         quotient_ops (list[SymmOp] | None):
-            Sapce group symmetry operations, in fractional coordinates,
+            Space group symmetry operations, in fractional coordinates,
             to test. If ``None``, determined from ``primitive``.
         symprec (float):
-            Symmetry precision for determining ``quotient_ops`` (if ``None``).
-            (Default: 0.01)
-        dist_tol (float):
-            Distance tolerance (in Å) within which paired point defects are
-            taken to coincide when matching complexes after symmetry. (Default: 0.01)
+            If ``quotient_ops`` is None, the precision for determining the
+            space group operations, which may be dynamically adjusted
+            when finding the space group. Else the precision at which the
+            ``quotient_ops`` were determined. (Default: 0.01)
+        dist_tol_factor (float):
+            Factor by which symprec is multiplied to give the distance
+            tolerance for matching equal complexes. (Default: 1.0)
         give_point_group (bool):
             Whether to also return the Schoenflies point group symbol of the
             complex (i.e. of the stabiliser). (Default: False)
@@ -1392,24 +1428,57 @@ def get_complex_orbit_and_stabiliser(
             The orbit and stabiliser of the complex in the crystal, per primitive
             lattice cell. If ``give_point_group`` is ``True``, the Schoenflies
             point group symbol of the complex is also returned as a third element.
+            All elements of the orbit are given in the unit primitive cell (i.e.
+            with complex centroids translated to lie within the unit cell).
     """
+    # get space group if not provided
     if quotient_ops is None:
-        quotient_ops = get_sga(primitive, symprec=symprec).get_symmetry_operations()
+        bulk_sga, symprec = get_sga_and_symprec(primitive, symprec)
+        quotient_ops = bulk_sga.get_symmetry_operations()
+
+    dist_tol = dist_tol_factor*symprec
+    lattice = primitive.lattice
+
+    # get labels and fractional coordinates, and centre the complex (centroid to unit cell)
+    point_labels = [site.species_string for site in point_defects]
+    point_fcs = np.asarray([site.frac_coords for site in point_defects])
+    point_fcs -= np.floor(np.mean(point_fcs, axis=0))
+
+    # apply operations
+    rotations = np.array([op.rotation_matrix for op in quotient_ops])  # (n_ops, 3, 3)
+    translations = np.array([op.translation_vector for op in quotient_ops])  # (n_ops, 3)
+    transformed_fcs = np.einsum("oij,nj->oni", rotations, point_fcs) + translations[:, None, :]
+        # (n_ops, n_sites, 3)
+
+    # centre all elements
+    transformed_fcs -= np.floor(np.mean(transformed_fcs, axis=1, keepdims=True))
 
     stabiliser = []
-    orbit = [point_defects]
+    fcs_orbit = [point_fcs]
 
-    for operation in quotient_ops:
-        new_complex = [
-            apply_symm_op_to_site(operation, site, rotate_lattice=False, fractional=True)
-            for site in point_defects
-        ]  # TODO: apply centring here?
-        if check_equivalent_complexes(point_defects, new_complex, dist_tol=dist_tol):
+    # check for matches
+    for operation, new_fcs in zip(quotient_ops, transformed_fcs, strict=True):
+        if _check_equal_frac_coords(
+            point_labels, point_fcs, point_labels, new_fcs, lattice, dist_tol=dist_tol
+        ):
             stabiliser.append(operation)
         elif not any(
-            check_equivalent_complexes(orb_elem, new_complex, dist_tol=dist_tol) for orb_elem in orbit
+            _check_equal_frac_coords(
+                point_labels, orb_fcs, point_labels, new_fcs, lattice, dist_tol=dist_tol
+            )
+            for orb_fcs in fcs_orbit[1:]  # already checked for stabiliser
         ):
-            orbit.append(new_complex)
+            fcs_orbit.append(new_fcs)
+
+    # recreate periodicsites
+    orbit = []
+    for complex_fcs in fcs_orbit:
+        new_sites = []
+        for site, fcs in zip(point_defects, complex_fcs, strict=True):
+            new_site = deepcopy(site)
+            new_site.frac_coords = fcs
+            new_sites.append(new_site)
+        orbit.append(new_sites)
 
     if give_point_group:
         rotations = [np.rint(op.rotation_matrix).astype(int) for op in stabiliser]
