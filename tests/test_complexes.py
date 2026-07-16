@@ -31,7 +31,7 @@ from doped.utils.symmetry import (
     get_all_equiv_sites,
     get_primitive_structure,
     get_sga,
-    is_periodic_image,
+    is_periodic_image_old,
     point_symmetry_from_site,
     point_symmetry_from_structure,
 )
@@ -208,7 +208,7 @@ class MoleculeMatcherTest(unittest.TestCase):
         )
         assert are_equivalent_molecules(self.mol, translated_mol)
         assert np.isclose(KabschMatcher(self.mol).fit(translated_mol)[-1], 0)
-        assert not is_periodic_image(_get_molecule_coords(self.mol), _get_molecule_coords(translated_mol))
+        assert not is_periodic_image_old(_get_molecule_coords(self.mol), _get_molecule_coords(translated_mol))
 
     def test_rotation_invariance(self):
         """
@@ -221,7 +221,7 @@ class MoleculeMatcherTest(unittest.TestCase):
         )
         assert are_equivalent_molecules(self.mol, rotated_mol)
         assert np.isclose(KabschMatcher(self.mol).fit(rotated_mol)[-1], 0)
-        assert not is_periodic_image(_get_molecule_coords(self.mol), _get_molecule_coords(rotated_mol))
+        assert not is_periodic_image_old(_get_molecule_coords(self.mol), _get_molecule_coords(rotated_mol))
 
     def test_permutation_invariance(self):
         """
@@ -242,9 +242,9 @@ class MoleculeMatcherTest(unittest.TestCase):
         assert not are_equivalent_molecules(self.mol, permuted_mol)
 
         # now it is counted as a periodic image as it's the same coordinates, just in a different order:
-        assert is_periodic_image(_get_molecule_coords(self.mol), _get_molecule_coords(permuted_mol))
+        assert is_periodic_image_old(_get_molecule_coords(self.mol), _get_molecule_coords(permuted_mol))
 
-    def test_is_periodic_image(self):
+    def test_is_periodic_image_old(self):
         """
         Test the ``is_periodic_image`` function.
         """
@@ -256,31 +256,31 @@ class MoleculeMatcherTest(unittest.TestCase):
         periodically_shifted_frac_coords = orig_frac_coords + np.array([1, 0, -1])
 
         assert is_coord_subset_pbc(orig_frac_coords, periodically_shifted_frac_coords)
-        assert is_periodic_image(orig_frac_coords, periodically_shifted_frac_coords)
-        assert is_periodic_image(orig_frac_coords, periodically_shifted_frac_coords, same_image=True)
+        assert is_periodic_image_old(orig_frac_coords, periodically_shifted_frac_coords)
+        assert is_periodic_image_old(orig_frac_coords, periodically_shifted_frac_coords, same_image=True)
 
         # now test shifted with _different_ periodic images:
         periodically_shifted_frac_coords[0] = periodically_shifted_frac_coords[0] + np.array([3, -2, 1])
         assert is_coord_subset_pbc(orig_frac_coords, periodically_shifted_frac_coords)
-        assert is_periodic_image(orig_frac_coords, periodically_shifted_frac_coords)
-        assert not is_periodic_image(orig_frac_coords, periodically_shifted_frac_coords, same_image=True)
+        assert is_periodic_image_old(orig_frac_coords, periodically_shifted_frac_coords)
+        assert not is_periodic_image_old(orig_frac_coords, periodically_shifted_frac_coords, same_image=True)
 
         # test permutation invariance:
         permuted_frac_coords = np.array([orig_frac_coords[i] for i in [1, 2, 0]])
         assert is_coord_subset_pbc(orig_frac_coords, permuted_frac_coords)
-        assert is_periodic_image(orig_frac_coords, permuted_frac_coords)
-        assert is_periodic_image(orig_frac_coords, permuted_frac_coords, same_image=True)
+        assert is_periodic_image_old(orig_frac_coords, permuted_frac_coords)
+        assert is_periodic_image_old(orig_frac_coords, permuted_frac_coords, same_image=True)
 
         # test unique matching (no duplicate matches allowed):
         duplicate_frac_coords = np.array([orig_frac_coords[i] for i in [0, 0, 2]])
         assert not is_coord_subset_pbc(orig_frac_coords, duplicate_frac_coords)
-        assert not is_periodic_image(orig_frac_coords, duplicate_frac_coords)
-        assert not is_periodic_image(orig_frac_coords, duplicate_frac_coords, same_image=True)
+        assert not is_periodic_image_old(orig_frac_coords, duplicate_frac_coords)
+        assert not is_periodic_image_old(orig_frac_coords, duplicate_frac_coords, same_image=True)
 
         duplicate_frac_coords[0] += np.array([1, 0, -1])
         assert not is_coord_subset_pbc(orig_frac_coords, duplicate_frac_coords)
-        assert not is_periodic_image(orig_frac_coords, duplicate_frac_coords)
-        assert not is_periodic_image(orig_frac_coords, duplicate_frac_coords, same_image=True)
+        assert not is_periodic_image_old(orig_frac_coords, duplicate_frac_coords)
+        assert not is_periodic_image_old(orig_frac_coords, duplicate_frac_coords, same_image=True)
 
 
 def _get_molecule_coords(mol):

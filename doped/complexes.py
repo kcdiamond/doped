@@ -35,7 +35,7 @@ from doped.utils.symmetry import (
     get_equiv_frac_coords_in_primitive,
     get_primitive_structure,
     get_sga_and_symprec,
-    is_periodic_image,
+    is_periodic_image_old,
     schoenflies_from_hermann,
 )
 
@@ -516,7 +516,7 @@ def get_equivalent_complex_defect_sites_in_primitive(
         # ``unique_candidate_equiv_molecules`` list
         for candidate_equiv_mol in matching_candidate_equiv_molecules:
             if not any(  # complex defect molecules which are not not identical or periodic images
-                is_periodic_image(
+                is_periodic_image_old(
                     [
                         primitive_structure.lattice.get_fractional_coords(site.coords)
                         for site in other_equiv_mol.sites
@@ -1295,7 +1295,7 @@ def get_standard_complex(
     return standard_complex
 
 
-def check_equal_complexes(
+def is_periodic_image(
     complex_1: list[PeriodicSite],
     complex_2: list[PeriodicSite],
     dist_tol: float = 0.01,  # TODO wout_charge?
@@ -1303,8 +1303,8 @@ def check_equal_complexes(
     r"""
     Determine whether two defect complexes are equal, up to a rigid integer
     lattice vector translation, and within dist_tol. Accepts a list of
-    PeriodicSite objects in any order. Plain Euclidean match, no per-site
-    periodic boundary conditions.
+    PeriodicSite objects in any order. Does not check for symmetry equivalent
+    complexes (i.e involving any rotation). The 
 
     Args:
         complex_1 (list[PeriodicSite]):

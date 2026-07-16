@@ -4475,10 +4475,8 @@ def get_orientational_degeneracy(
     )
 
 
-# TODO: bugs in this function?
-# same_image = False allows many-to-one mappings
-# same_image = True also seems to fail if multiple sites equal mod 1
-def is_periodic_image(
+# NOTE deprecated function replaced by doped.complexes.is_periodic_image
+def is_periodic_image_old(
     sites_1: Iterable[PeriodicSite | np.ndarray],
     sites_2: Iterable[PeriodicSite | np.ndarray],
     frac_tol: float = 0.01,
