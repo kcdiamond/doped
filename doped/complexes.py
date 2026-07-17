@@ -19,6 +19,7 @@ from pymatgen.core.lattice import Lattice
 from pymatgen.core.operations import SymmOp
 from pymatgen.core.structure_matcher import get_linear_assignment_solution
 from pymatgen.util.coord import get_angle, pbc_shortest_vectors
+from scipy.cluster.hierarchy import fcluster, linkage
 from spglib import get_pointgroup
 from tqdm import tqdm
 
@@ -31,6 +32,7 @@ from doped.utils.parsing import (
     get_matching_site,
 )
 from doped.utils.symmetry import (
+    _frac_coords_sort_func,
     get_distance_matrix,
     get_equiv_frac_coords_in_primitive,
     get_primitive_structure,
@@ -1235,66 +1237,6 @@ def get_split_vacancies_from_database(*args, verbose: bool | str = False):
     raise NotImplementedError("Not implemented yet.")
 
 
-def get_standard_complex(
-    point_defects: list[tuple[str, np.ndarray]],
-    return_sort_index: bool = False,
-    prec: int | None = None,
-) -> list[tuple[str, np.ndarray]] | tuple[list[tuple[str, np.ndarray]], list[int]]:
-    """
-    Get a standardised representation of a defect complex.
-
-    The fractional coordinates of the constituent point defects are
-    translated (by an integer number of lattice vectors) so that the
-    centroid of the complex lies within the primitive cell, and the point
-    defects are then sorted to give a reproducible ordering. This provides a
-    canonical representation which can be compared to identify equivalent
-    complexes.
-
-    Args:
-        point_defects (list[tuple[str, np.ndarray]]):
-            List of tuples describing the point defects which make up the
-            complex, each being a label (``str``) and the fractional
-            coordinates (``np.ndarray``) of that point defect in the
-            primitive structure.
-        prec (int):
-            Number of decimal places to round the fractional coordinates to,
-            before determining the standard representation.
-            (Default: None - no rounding)
-        return_sort_index (bool):
-            If ``True``, also return the list of indices which sorts
-            ``point_defects`` into the standard ordering. This can be used to
-            reorder any additional data aligned with ``point_defects`` (i.e.
-            ``[data[i] for i in sort_index]``) into the same ordering.
-            (Default: False)
-
-    Returns (list[tuple[str, np.ndarray]] | list[int]]):
-        The input list of point-defect tuples, with fractional coordinates
-        translated so the complex centroid lies within the primitive cell,
-        and sorted by label then coordinates. If ``return_sort_index`` is
-        ``True``, the indices which sort the input ``point_defects`` into the
-        standard ordering are also returned, as ``(standard_complex,
-        sort_index)``.
-    """
-    labels, site_fcs = zip(*point_defects, strict=False)
-
-    # round
-    if prec is not None:
-        site_fcs = np.round(site_fcs, prec)
-
-    # map centroid to primitive
-    centroid = np.mean(site_fcs, axis=0)
-    site_fcs += -np.floor(centroid)
-
-    # sort by label, then coords (the coordinate array is cast to a tuple so
-    # that the sort keys are unambiguously comparable)
-    sort_index = sorted(range(len(labels)), key=lambda i: (labels[i], tuple(site_fcs[i])))
-    standard_complex = [(labels[i], site_fcs[i]) for i in sort_index]
-
-    if return_sort_index:
-        return standard_complex, sort_index
-    return standard_complex
-
-
 def is_periodic_image(
     complex_1: list[PeriodicSite],
     complex_2: list[PeriodicSite],
@@ -1304,7 +1246,7 @@ def is_periodic_image(
     Determine whether two defect complexes are equal, up to a rigid integer
     lattice vector translation, and within dist_tol. Accepts a list of
     PeriodicSite objects in any order. Does not check for symmetry equivalent
-    complexes (i.e involving any rotation). The 
+    complexes (i.e. involving any rotation).
 
     Args:
         complex_1 (list[PeriodicSite]):
@@ -1320,27 +1262,31 @@ def is_periodic_image(
         bool:
             ``True`` if the two complexes are equivalent, else ``False``.
     """
-    return _check_equal_complex_frac_coords(
-        [site.species_string for site in complex_1],
-        np.asarray([site.frac_coords for site in complex_1]),
-        [site.species_string for site in complex_2],
-        np.asarray([site.frac_coords for site in complex_2]),
-        complex_1[0].lattice,
-        dist_tol=dist_tol,
+    return (
+        _complex_frac_coords_dist(
+            [site.species_string for site in complex_1],
+            np.asarray([site.frac_coords for site in complex_1]),
+            [site.species_string for site in complex_2],
+            np.asarray([site.frac_coords for site in complex_2]),
+            complex_1[0].lattice,
+        )
+        <= dist_tol
     )
 
 
-def _check_equal_complex_frac_coords(
+# maybe should be changed to a consistent metric for large tolerances
+# ie check over all periodic images and assignments for min dist
+def _complex_frac_coords_dist(
     labels_1: list[str],
     frac_coords_1: np.ndarray,
     labels_2: list[str],
     frac_coords_2: np.ndarray,
     lattice: Lattice,
-    dist_tol: float = 0.01,
-) -> bool:
+) -> float:
     """
-    See check_equal_complexes, but for frac_coords and labels without
-    PeriodicSite objects.
+    Metric between (similar) complexes, defined as the maximum distance between
+    corresponding sites, after per-label linear assignment between the two
+    complexes. Invariant to integer lattice translations of either complex.
 
     Args:
         labels_1 (list[str]):
@@ -1354,43 +1300,113 @@ def _check_equal_complex_frac_coords(
             Fractional coordinates of the point defects in the second complex.
         lattice (|Lattice|):
             Lattice to which the fractional coordinates correspond.
-        dist_tol (float):
-            Distance tolerance (in Å) within which paired point defects are
-            taken to coincide. (Default: 0.01)
 
     Returns:
-        bool:
-            ``True`` if the two complexes are equivalent, else ``False``.
+        float:
+            Maximum matched per-site distance (in Å) between the two
+            complexes, or ``np.inf`` if their compositions differ.
     """
-    if Counter(labels_1) != Counter(labels_2):  # different compositions
-        return False
+    # compositions differ - no tolerance
+    if Counter(labels_1) != Counter(labels_2):
+        return np.inf
 
-    # match centres by integer lattice vector
-    centroid_1 = np.mean(frac_coords_1, axis=0)
-    centroid_2 = np.mean(frac_coords_2, axis=0)
-    int_shift = np.round(centroid_1 - centroid_2)
-
-    # false if not integer lattice vector
-    centroid_diff = lattice.get_cartesian_coords(centroid_1 - centroid_2 - int_shift)
-    if np.linalg.norm(centroid_diff) > dist_tol:
-        return False
+    # match centroids
+    int_shift = np.round(np.mean(frac_coords_1, axis=0) - np.mean(frac_coords_2, axis=0))
 
     labels_arr_1 = np.asarray(labels_1)
     labels_arr_2 = np.asarray(labels_2)
 
-    # check each label for match
+    # per label linear assignment, and get max of max distance within each label
+    max_dist = 0.0
     for label in set(labels_1):
         cart_1 = lattice.get_cartesian_coords(frac_coords_1[labels_arr_1 == label])
         cart_2 = lattice.get_cartesian_coords(frac_coords_2[labels_arr_2 == label] + int_shift)
         cart_dists = np.linalg.norm(cart_1[:, None, :] - cart_2[None, :, :], axis=-1)
         matches, _ = get_linear_assignment_solution(cart_dists)
-        if np.any(cart_dists[np.arange(len(matches)), matches] > dist_tol):
-            return False
+        max_dist = max(max_dist, np.max(cart_dists[np.arange(len(matches)), matches]))
 
-    return True
+    return float(max_dist)
 
 
-# TODO use clustering instead of matching to first
+def cluster_complexes_by_dist_tol(
+    complexes: list[list[PeriodicSite]],
+    dist_tol: float = 0.01,
+    method: str = "single",
+    criterion: str = "distance",
+) -> tuple[list[list[PeriodicSite]], list[list[int]]]:
+    r"""
+    Cluster defect complexes based on their distances, analogous to
+    ``cluster_sites_by_dist_tol`` for point defect sites.
+
+    The metric for clustering is maximum distance between corresponding
+    sites after linear assignment of sites per label. Invariant to
+    translation of any complexes by an integer lattice vector.
+
+    Args:
+        complexes (Sequence[list[PeriodicSite]]):
+            Complexes to cluster, each as a list of constituent point defect
+            sites (|PeriodicSite| objects on a common lattice).
+        dist_tol (float):
+            Distance tolerance for clustering, in Å (default: 0.01).
+        method (str):
+            Clustering algorithm to use. (Default: ``"single"``.)
+            See  `~doped.utils.symmetry.cluster_coords` for details.
+        criterion (str):
+            Criterion for flattening clusters. (Default: ``"distance"``.)
+            See  `~doped.utils.symmetry.cluster_coords` for details.
+
+    Returns:
+        tuple[list[list[PeriodicSite]], list[list[int]]]:
+            One representative complex per cluster (the first member),
+            and the indices of the input complexes in each cluster, ordered
+            as input.
+    """
+    cluster_indices = _cluster_complex_frac_coords(
+        [[site.species_string for site in complex_sites] for complex_sites in complexes],
+        [np.asarray([site.frac_coords for site in complex_sites]) for complex_sites in complexes],
+        complexes[0][0].lattice,
+        dist_tol=dist_tol,
+        method=method,
+        criterion=criterion,
+    )
+    return [list(complexes[idx[0]]) for idx in cluster_indices], cluster_indices
+
+
+def _cluster_complex_frac_coords(
+    all_labels: list[list[str]],
+    all_fcs: np.ndarray | list[np.ndarray],
+    lattice: Lattice,
+    dist_tol: float = 0.01,
+    method: str = "single",
+    criterion: str = "distance",
+) -> list[list[int]]:
+    """
+    See ``cluster_complexes_by_dist_tol``, but takes frac coords and labels.
+    """
+    if len(all_fcs) == 1:
+        return [[0]]
+
+    # make condensed distance array using _complex_frac_coords_dist metric
+    condensed_dists = np.array(
+        [
+            _complex_frac_coords_dist(all_labels[i], all_fcs[i], all_labels[j], all_fcs[j], lattice)
+            for i, j in combinations(range(len(all_fcs)), 2)
+        ]
+    )
+
+    # linkage doesn't take inf but to avoid clustering different composition
+    condensed_dists[~np.isfinite(condensed_dists)] = 1e10
+
+    # cluster
+    cn = fcluster(linkage(condensed_dists, method=method), dist_tol, criterion=criterion)
+
+    # group member indices by cluster ordered by first appearance
+    return sorted(
+        (np.where(cn == n)[0].tolist() for n in set(cn)),
+        key=lambda idx: idx[0],
+    )
+
+
 def get_complex_orbit_and_stabiliser(
     point_defects: list[PeriodicSite],
     primitive: Structure,
@@ -1401,7 +1417,8 @@ def get_complex_orbit_and_stabiliser(
 ) -> tuple[list[list[PeriodicSite]], list[SymmOp]] | tuple[list[list[PeriodicSite]], list[SymmOp], str]:
     """
     Get the orbit and stabiliser of a defect complex, given a primitive
-    structure.
+    structure. The order of sites is maintained from input to output, and the
+    first complex in the orbit corresponds to the input.
 
     Args:
         point_defects (list[PeriodicSite]):
@@ -1418,7 +1435,7 @@ def get_complex_orbit_and_stabiliser(
             ``quotient_ops`` were determined. (Default: 0.01)
         dist_tol_factor (float):
             Factor by which symprec is multiplied to give the distance
-            tolerance for matching equal complexes. (Default: 1.0)
+            tolerance for clustering equal complexes. (Default: 1.0)
         give_point_group (bool):
             Whether to also return the Schoenflies point group symbol of the
             complex (i.e. of the stabiliser). (Default: False)
@@ -1453,29 +1470,26 @@ def get_complex_orbit_and_stabiliser(
     # centre all complexes to unit primitive
     transformed_fcs -= np.floor(np.mean(transformed_fcs, axis=1, keepdims=True))
 
-    stabiliser = []
-    fcs_orbit = [point_fcs]
+    # add the original complex back in for ease of identifying stabiliser
+    all_fcs = np.concatenate([point_fcs[None, :, :], transformed_fcs])  # (n_ops + 1, n_sites, 3)
 
-    # check for matches
-    for operation, new_fcs in zip(quotient_ops, transformed_fcs, strict=True):
-        if _check_equal_complex_frac_coords(
-            point_labels, point_fcs, point_labels, new_fcs, lattice, dist_tol=dist_tol
-        ):
-            stabiliser.append(operation)
-        elif not any(
-            _check_equal_complex_frac_coords(
-                point_labels, orb_fcs, point_labels, new_fcs, lattice, dist_tol=dist_tol
-            )
-            for orb_fcs in fcs_orbit[1:]  # already checked for stabiliser
-        ):
-            fcs_orbit.append(new_fcs)
+    # cluster
+    cluster_indices = _cluster_complex_frac_coords(
+        [point_labels] * len(all_fcs), all_fcs, lattice, dist_tol=dist_tol
+    )
 
-    # orbit-stabiliser warning
-    if len(fcs_orbit) * len(stabiliser) != len(quotient_ops):
+    # get orbit and stabiliser
+    stabiliser = [quotient_ops[i - 1] for i in cluster_indices[0] if i > 0]
+    fcs_orbit = [all_fcs[idx[0]] for idx in cluster_indices]
+
+    # check group theory results
+    coset_sizes = [len(idx) for idx in cluster_indices]
+    coset_sizes[0] -= 1  # take out duplicate initial complex
+    if any(size != len(stabiliser) for size in coset_sizes):
         warnings.warn(
-            f"|orbit| ({len(fcs_orbit)}) * |stabiliser| ({len(stabiliser)}) != |G| "
-            f"({len(quotient_ops)}). Check the symmetry tolerances used (symprec = {symprec}, dist_tol "
-            f"= {dist_tol})."
+            f"Unequal complex cluster (coset) sizes ({coset_sizes})."
+            f"Check the symmetry tolerances used (symprec = {symprec}, "
+            f"dist_tol = {dist_tol})."
         )
 
     # recreate PeriodicSite objects
@@ -1496,3 +1510,61 @@ def get_complex_orbit_and_stabiliser(
         return orbit, stabiliser, schoenflies_from_hermann(hermann_symbol.strip())
 
     return orbit, stabiliser
+
+
+def sort_complex_orbit(
+    orbit: list[list[PeriodicSite]],
+    return_sort_index: bool = False,
+    prec: int = 5,
+) -> list[list[PeriodicSite]] | tuple[list[list[PeriodicSite]], list[int]]:
+    r"""
+    Deterministically sort the members of a defect complex orbit (e.g. as
+    output by ``get_complex_orbit_and_stabiliser``). The order of the point
+    defects within each complex on input is maintained, and the complex sort
+    order is independent of the order of these point defects.
+
+    The sorting order is based on the point defects, but is not the same order as
+    _sort_defects, and is intended only to give a deterministic output order of
+    symmetry-equivalent complexes.
+
+    Args:
+        orbit (list[list[PeriodicSite]]):
+            Orbit of a defect complex, as output by
+            ``get_complex_orbit_and_stabiliser`` (i.e. with all members
+            sharing a common constituent ordering, and centroids translated
+            to lie within the unit cell, and given relative to primitive cell).
+        return_sort_index (bool):
+            If ``True``, also return the list of indices which sorts the
+            input orbit members into the standard ordering.
+        prec (int):
+            Number of decimal places to which fractional coordinates are
+            rounded for sort keys.
+            (Default: 5)
+
+    Returns:
+        list[list[PeriodicSite]] | tuple[list[list[PeriodicSite]], list[int]]:
+            The sorted orbit. If ``return_sort_index`` is ``True``, the
+            indices which sort the input orbit members are also returned,
+            as ``(sorted_orbit, sort_index)``.
+    """
+    labels = [site.species_string for site in orbit[0]]
+
+    # define key for sorting complexes
+    # firstly sort by centroid, then by constituent point defects
+    # (equal complexes should have the same key)
+    def _member_key(member: list[PeriodicSite]) -> tuple:
+        member_fcs = np.asarray([site.frac_coords for site in member])
+        centroid = np.mean(member_fcs, axis=0)
+        rel_fcs = np.round(member_fcs - centroid, prec)
+        return (
+            _frac_coords_sort_func(centroid),
+            sorted(zip(labels, map(tuple, rel_fcs), strict=True)),
+        )
+
+    # sort complexes by key
+    sort_index = sorted(range(len(orbit)), key=lambda k: _member_key(orbit[k]))
+    sorted_orbit = [orbit[k] for k in sort_index]
+
+    if return_sort_index:
+        return sorted_orbit, sort_index
+    return sorted_orbit

@@ -27,9 +27,11 @@ from pymatgen.io.vasp.outputs import Procar, Vasprun
 from pymatgen.util.typing import PathLike
 from tqdm import tqdm
 
-from doped.complexes import get_complex_orbit_and_stabiliser
+from doped.complexes import get_complex_orbit_and_stabiliser, sort_complex_orbit
 from doped.core import Defect, DefectComplex, DefectEntry, guess_and_set_oxi_states_with_timeout
 from doped.generation import (
+    _defect_sort_key,
+    _get_element_list,
     get_defect_name_from_defect,
     get_defect_name_from_entry,
     name_defect_entries,
@@ -78,6 +80,7 @@ from doped.utils.plotting import format_defect_name
 from doped.utils.supercells import get_min_image_distance
 from doped.utils.symmetry import (
     _frac_coords_sort_func,
+    get_all_equiv_sites,
     get_equiv_frac_coords_in_primitive,
     get_orientational_degeneracy,
     get_primitive_structure,
@@ -700,10 +703,37 @@ def defect_complex_from_structures(
     # get offset such that centroid lands in unit primitive
     offset -= np.floor(np.mean(unwrapped_fc, axis=0) @ sc_matrix + offset)
 
+    # recreate sites in primitive
+    rel_obj_fcs = [sc_fc @ sc_matrix + offset for sc_fc in unwrapped_fc]
+    rel_obj_sites = [
+        PeriodicSite(
+            defect_obj_sites_sc[defect_idx].species,
+            rel_fc,
+            primitive_structure.lattice,
+            coords_are_cartesian=False,
+        )
+        for defect_idx, rel_fc in enumerate(rel_obj_fcs)
+    ]
+
+    # GET EQUIVALENT COMPLEXES
+
+    # get equivalent complexes
+    orbit = get_complex_orbit_and_stabiliser(
+        rel_obj_sites,
+        primitive_structure,
+        **{k: v for k, v in kwargs.items() if k in ["symprec", "dist_tol_factor"]},
+    )[0]
+
+    # sort deterministically and take standard representative complex
+    sorted_orbit = sort_complex_orbit(orbit)
+    assert isinstance(sorted_orbit, list)
+    orbit = sorted_orbit
+    rel_obj_sites = orbit[0]
+    # note order of point defects is unchanged
+
     # GENERATE POINT DEFECT OBJECTS
 
     point_defects = []
-    defect_obj_rel_sites = []
     all_info = []
     for defect_idx, defect_site_info in enumerate(defect_sites_info):
         (
@@ -715,20 +745,18 @@ def defect_complex_from_structures(
             guessed_initial_defect_structure,
             unrelaxed_defect_structure,
         ) = defect_site_info
+        rel_obj_fc = rel_obj_sites[defect_idx].frac_coords
 
-        # transform to primitive
-        rel_defect_obj_site_fc = unwrapped_fc[defect_idx] @ sc_matrix + offset
-
-        # get defect site in primitive structure, for Defect generation:
-        equiv_frac_coords_in_prim = get_equiv_frac_coords_in_primitive(
-            frac_coords=defect_obj_sites_sc[defect_idx].frac_coords,
-            primitive=primitive_structure,
-            supercell=bulk_supercell,
+        # get all equivalent sites in primitive
+        equiv_frac_coords_in_prim = get_all_equiv_sites(
+            frac_coords=rel_obj_fc % 1.0,
+            structure=primitive_structure,
+            just_frac_coords=True,
             **equiv_kwargs,
-        )  # equiv_coords=True, return_symprec_and_dist_tol_factor=False (default)
+        )
         assert isinstance(equiv_frac_coords_in_prim, list | np.ndarray)
-        # sort equiv_frac_coords_in_prim deterministically, using _frac_coords_sort_func: (first coords in
-        # equiv_frac_coords_in_prim are used as ``Defect.site``, for point defects)
+
+        # sort equiv_frac_coords_in_prim deterministically, using _frac_coords_sort_func
         equiv_frac_coords_in_prim = sorted(equiv_frac_coords_in_prim, key=_frac_coords_sort_func)
         equiv_defect_sites_in_prim = [
             PeriodicSite(
@@ -740,25 +768,30 @@ def defect_complex_from_structures(
             for frac_coords_in_prim in equiv_frac_coords_in_prim
         ]
 
-        if defect_type != "interstitial":  # ensure exact matches to Defect.structure (primitive) sites:
+        # TODO why did we make PeriodicSites just to copy and remake instead of working in fc
+        # snap equivalent point defect sites for vac/sub to exact match in bulk
+        if defect_type != "interstitial":
             for defect_site_in_prim in equiv_defect_sites_in_prim:
                 bulk_site_in_prim = deepcopy(defect_site_in_prim)
                 bulk_site_in_prim.species = bulk_supercell[bulk_site_index].species
                 bulk_site_in_prim = get_matching_site(bulk_site_in_prim, primitive_structure)
                 defect_site_in_prim.frac_coords = bulk_site_in_prim.frac_coords
 
-            # snap site for Defect object site to site in bulk but in correct (non-unit) cell
-            matched_prim_site = get_matching_site(rel_defect_obj_site_fc, primitive_structure)
-            rel_lattice_vector = np.rint(rel_defect_obj_site_fc - matched_prim_site.frac_coords)
-            rel_defect_obj_site_fc = matched_prim_site.frac_coords + rel_lattice_vector
+            # snap relative sites to site in bulk but in correct (non-unit) cell
+            for equiv_complex in orbit:
+                equiv_rel_site = deepcopy(equiv_complex[defect_idx])
+                equiv_rel_site.species = bulk_supercell[bulk_site_index].species
+                matched_prim_site = get_matching_site(equiv_rel_site, primitive_structure)
+                equiv_complex[defect_idx].frac_coords = matched_prim_site.frac_coords + np.rint(
+                    equiv_rel_site.frac_coords - matched_prim_site.frac_coords
+                )
 
         defect_obj_site = PeriodicSite(
             defect_obj_sites_sc[defect_idx].species,
-            rel_defect_obj_site_fc,
+            rel_obj_sites[defect_idx].frac_coords,
             primitive_structure.lattice,
             coords_are_cartesian=False,
         )
-        defect_obj_rel_sites.append(defect_obj_site)
 
         # drop unsupported Defect() kwargs for non-interstitial defects
         defect_init_kwargs = (
@@ -800,14 +833,24 @@ def defect_complex_from_structures(
                 )
             )
 
-    # GET EQUIVALENT COMPLEXES
+    # SORT POINT DEFECTS
 
-    # get equivalent complexes
-    orbit = get_complex_orbit_and_stabiliser(
-        defect_obj_rel_sites,
-        primitive_structure,
-    )[0]  # TODO kwargs
-    # TODO do these have to be snapped again...?
+    # sort point defects deterministically (matching ``_sort_defects``, then by prim
+    # site coords instead of conv cell for same name), along with accompanying info
+    element_list = _get_element_list(point_defects)
+    sort_index = sorted(
+        range(len(point_defects)),
+        key=lambda i: (
+            _defect_sort_key(point_defects[i], element_list),
+            tuple(np.round(point_defects[i].site.frac_coords, 5)),
+        ),
+    )
+    point_defects = [point_defects[i] for i in sort_index]
+    orbit = [[member[i] for i in sort_index] for member in orbit]
+    if return_all_info:
+        all_info = [all_info[i] for i in sort_index]
+
+    # RETURN COMPLEX
 
     complex_defect = DefectComplex(point_defects, equivalent_complexes=orbit)
 

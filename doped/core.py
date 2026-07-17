@@ -3204,6 +3204,12 @@ class DefectComplex(core.DefectComplex, Defect):
         """
         Subclass of :class:`~pymatgen.analysis.defects.core.DefectComplex` with
         additional attributes and methods used by ``doped``.
+
+        Temp notes:
+        DefectComplex.site -> DummySpecies at centroid
+        Defect.site -> relative site of defect, possibly not in unit cell
+        equivalent_sites always naive equivalent sites, ignoring complex
+        equivalent_complexes -> relative sites, possibly not in unit cell
         """
         self.defects = defects
         self.equivalent_complexes = equivalent_complexes

@@ -2654,6 +2654,19 @@ def sort_defect_entries(defect_entries: dict | list, element_list: list | None =
     return sorted_defect_entries_dict  # else dict
 
 
+def _defect_sort_key(defect: Defect, element_list: list[str]) -> tuple:
+    """
+    Deterministic sort key for |Defect| objects; see ``_sort_defects``.
+    """
+    return (
+        defect.defect_type.value,
+        _list_index_or_val(element_list, _first_and_second_element(defect.name)[0]),
+        _list_index_or_val(element_list, _first_and_second_element(defect.name)[1]),
+        defect.name,  # bare name without charge
+        symmetry._frac_coords_sort_func(getattr(defect, "conv_cell_frac_coords", None)),
+    )
+
+
 def _sort_defects(defects_dict: dict, element_list: list[str] | None = None):
     """
     Sort defect objects for deterministic behaviour (for output and when
@@ -2668,15 +2681,7 @@ def _sort_defects(defects_dict: dict, element_list: list[str] | None = None):
         element_list = _get_element_list(defects_dict)
 
     return {
-        defect_type: sorted(
-            defect_list,
-            key=lambda d: (
-                _list_index_or_val(element_list, _first_and_second_element(d.name)[0]),
-                _list_index_or_val(element_list, _first_and_second_element(d.name)[1]),
-                d.name,  # bare name without charge
-                symmetry._frac_coords_sort_func(d.conv_cell_frac_coords),
-            ),
-        )
+        defect_type: sorted(defect_list, key=lambda d: _defect_sort_key(d, element_list))
         for defect_type, defect_list in defects_dict.items()
     }
 
