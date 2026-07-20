@@ -27,7 +27,7 @@ from pymatgen.io.vasp.outputs import Procar, Vasprun
 from pymatgen.util.typing import PathLike
 from tqdm import tqdm
 
-from doped.complexes import get_complex_orbit_and_stabiliser, sort_complex_orbit
+from doped.complexes import get_complex_orbit_and_stabiliser, unwrap_and_transform_to_prim
 from doped.core import Defect, DefectComplex, DefectEntry, guess_and_set_oxi_states_with_timeout
 from doped.generation import (
     _defect_sort_key,
@@ -45,7 +45,6 @@ from doped.utils import (
     get_mp_context,
     pool_manager,
 )
-from doped.utils.configurations import get_transformation_from_s2_to_s1
 from doped.utils.efficiency import StructureMatcher_scan_stol, _parse_site_species_str
 from doped.utils.parsing import (
     _CALC_OUTPUT_MASK,
@@ -77,7 +76,6 @@ from doped.utils.parsing import (
     total_charge_from_vasprun,
 )
 from doped.utils.plotting import format_defect_name
-from doped.utils.supercells import get_min_image_distance
 from doped.utils.symmetry import (
     _frac_coords_sort_func,
     get_all_equiv_sites,
@@ -650,35 +648,7 @@ def defect_complex_from_structures(
         )
     ]
 
-    # UNWRAPPING
-
-    # try first unwrapping
-    max_complex_span = get_min_image_distance(bulk_supercell) / 2
-    unwrapped_fc = [
-        def_site.frac_coords + defect_obj_sites_sc[0].distance_and_image(def_site)[1]
-        for def_site in defect_obj_sites_sc
-    ]
-    cart_coords = bulk_supercell.lattice.get_cartesian_coords(unwrapped_fc)
-    complex_span = np.linalg.norm(cart_coords[:, None] - cart_coords, axis=-1).max()
-
-    # if unwrapping is not unique, get best - anchor with smallest max distance to all other points
-    if complex_span >= max_complex_span:
-        for anchor_site in defect_obj_sites_sc[1:]:
-            candidate_fc = [
-                def_site.frac_coords + anchor_site.distance_and_image(def_site)[1]
-                for def_site in defect_obj_sites_sc
-            ]
-            cart_coords = bulk_supercell.lattice.get_cartesian_coords(candidate_fc)
-            candidate_span = np.linalg.norm(cart_coords[:, None] - cart_coords, axis=-1).max()
-            if candidate_span < complex_span:
-                unwrapped_fc, complex_span = candidate_fc, candidate_span
-        warnings.warn(
-            f"The defect complex spans {complex_span:.2f} Å, which is greater than half the min "
-            f"image distance of the supercell ({max_complex_span:.2f} Å). The unwrapped complex "
-            f"may be ambiguous."
-        )
-
-    # TRANSFORM SUPERCELL TO PRIMITIVE CELL
+    # UNWRAP COMPLEX SITES AND TRANSFORM TO PRIMITIVE CELL
 
     primitive_structure = get_primitive_structure(bulk_supercell, symprec=kwargs.get("symprec") or 0.01)
 
@@ -687,49 +657,26 @@ def defect_complex_from_structures(
         for k, v in kwargs.items()
         if k in ["symprec", "dist_tol_factor", "fixed_symprec_and_dist_tol_factor", "verbose"]
     }
-
-    # get transformation to primitive
     sm_kwargs = {
         k: v
         for k, v in kwargs.items()
         if k in ["ltol", "stol", "angle_tol", "min_stol", "max_stol", "stol_factor", "comparator"]
     }
-    sc_matrix, trans_vector, _mapping = get_transformation_from_s2_to_s1(
-        bulk_supercell, primitive_structure, attempt_supercell=True, scale=False, **sm_kwargs
+    rel_obj_sites = unwrap_and_transform_to_prim(
+        bulk_supercell, defect_obj_sites_sc, primitive_structure, **sm_kwargs
     )
-    sc_matrix = np.asarray(sc_matrix)
-    offset = -np.asarray(trans_vector) @ sc_matrix
-
-    # get offset such that centroid lands in unit primitive
-    offset -= np.floor(np.mean(unwrapped_fc, axis=0) @ sc_matrix + offset)
-
-    # recreate sites in primitive
-    rel_obj_fcs = [sc_fc @ sc_matrix + offset for sc_fc in unwrapped_fc]
-    rel_obj_sites = [
-        PeriodicSite(
-            defect_obj_sites_sc[defect_idx].species,
-            rel_fc,
-            primitive_structure.lattice,
-            coords_are_cartesian=False,
-        )
-        for defect_idx, rel_fc in enumerate(rel_obj_fcs)
-    ]
 
     # GET EQUIVALENT COMPLEXES
 
     # get equivalent complexes
-    orbit = get_complex_orbit_and_stabiliser(
+    orbit_and_stabiliser = get_complex_orbit_and_stabiliser(
         rel_obj_sites,
         primitive_structure,
         **{k: v for k, v in kwargs.items() if k in ["symprec", "dist_tol_factor"]},
-    )[0]
-
-    # sort deterministically and take standard representative complex
-    sorted_orbit = sort_complex_orbit(orbit)
-    assert isinstance(sorted_orbit, list)
-    orbit = sorted_orbit
+    )
+    orbit, stabiliser = orbit_and_stabiliser[0], orbit_and_stabiliser[1]
     rel_obj_sites = orbit[0]
-    # note order of point defects is unchanged
+    # note order of point defects within each orbit member is unchanged
 
     # GENERATE POINT DEFECT OBJECTS
 
@@ -852,7 +799,7 @@ def defect_complex_from_structures(
 
     # RETURN COMPLEX
 
-    complex_defect = DefectComplex(point_defects, equivalent_complexes=orbit)
+    complex_defect = DefectComplex(point_defects, equivalent_complexes=orbit, stabiliser=stabiliser)
 
     if not return_all_info:
         return complex_defect

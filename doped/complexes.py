@@ -1407,18 +1407,114 @@ def _cluster_complex_frac_coords(
     )
 
 
+def unwrap_and_transform_to_prim(
+    bulk_supercell: Structure,
+    sites: list[PeriodicSite],
+    primitive_structure: Structure | None = None,
+    symprec: float = 0.01,
+    **sm_kwargs,
+) -> list[PeriodicSite]:
+    """
+    Unwrap a set of (defect complex) sites in a bulk supercell and transform
+    them into the primitive host frame.
+
+    The sites are first unwrapped to the unique complex or (with warning)
+    to the complex with the smallest span. They are then transformed to the
+    primitive basis, such that the centroid lands in the unit primitive cell.
+    The ordering of the input sites is unchanged.
+
+    Args:
+        bulk_supercell (|Structure|):
+            Bulk supercell host structure, in which ``sites`` are defined.
+        sites (list[|PeriodicSite|]):
+            Constituent (defect) sites to unwrap and transform, defined in
+            the ``bulk_supercell`` frame.
+        primitive_structure (|Structure| | None):
+            Primitive host structure to transform the sites into. If ``None``
+            (default), computed from ``bulk_supercell`` using
+            ``get_primitive_structure`` (with ``symprec``).
+        symprec (float):
+            Symmetry precision for computing the primitive structure, if not
+            provided. (Default: 0.01)
+        **sm_kwargs:
+            Additional keyword arguments for the supercell-to-primitive
+            transformation (``get_transformation_from_s2_to_s1``, i.e.
+            |StructureMatcher| keyword arguments such as ``ltol``, ``stol``,
+            ``angle_tol``, ``comparator``).
+
+    Returns:
+        list[|PeriodicSite|]:
+            The unwrapped sites recreated in the primitive host frame (same
+            species and ordering as ``sites``).
+    """
+    from doped.utils.configurations import get_transformation_from_s2_to_s1
+    from doped.utils.supercells import get_min_image_distance
+
+    if primitive_structure is None:
+        primitive_structure = get_primitive_structure(bulk_supercell, symprec=symprec)
+
+    # UNWRAPPING
+
+    # try first unwrapping
+    max_complex_span = get_min_image_distance(bulk_supercell) / 2
+    unwrapped_fc = [site.frac_coords + sites[0].distance_and_image(site)[1] for site in sites]
+    cart_coords = bulk_supercell.lattice.get_cartesian_coords(unwrapped_fc)
+    complex_span = np.linalg.norm(cart_coords[:, None] - cart_coords, axis=-1).max()
+
+    # if unwrapping is not unique, get best - anchor with smallest max distance to all other points
+    if complex_span >= max_complex_span:
+        for anchor_site in sites[1:]:
+            candidate_fc = [site.frac_coords + anchor_site.distance_and_image(site)[1] for site in sites]
+            cart_coords = bulk_supercell.lattice.get_cartesian_coords(candidate_fc)
+            candidate_span = np.linalg.norm(cart_coords[:, None] - cart_coords, axis=-1).max()
+            if candidate_span < complex_span:
+                unwrapped_fc, complex_span = candidate_fc, candidate_span
+        warnings.warn(
+            f"The defect complex spans {complex_span:.2f} Å, which is greater than half the min "
+            f"image distance of the supercell ({max_complex_span:.2f} Å). The unwrapped complex "
+            f"may be ambiguous."
+        )
+
+    # TRANSFORM SUPERCELL TO PRIMITIVE CELL
+
+    # get transformation to primitive
+    sm_kwargs.setdefault("attempt_supercell", True)
+    sm_kwargs.setdefault("scale", False)
+    sc_matrix, trans_vector, _mapping = get_transformation_from_s2_to_s1(
+        bulk_supercell, primitive_structure, **sm_kwargs
+    )
+    sc_matrix = np.asarray(sc_matrix)
+    offset = -np.asarray(trans_vector) @ sc_matrix
+    # get offset such that centroid lands in unit primitive
+    offset -= np.floor(np.mean(unwrapped_fc, axis=0) @ sc_matrix + offset)
+
+    # recreate sites in primitive
+    rel_obj_fcs = [sc_fc @ sc_matrix + offset for sc_fc in unwrapped_fc]
+    return [
+        PeriodicSite(site.species, rel_fc, primitive_structure.lattice, coords_are_cartesian=False)
+        for site, rel_fc in zip(sites, rel_obj_fcs, strict=True)
+    ]
+
+
 def get_complex_orbit_and_stabiliser(
     point_defects: list[PeriodicSite],
     primitive: Structure,
     quotient_ops: list[SymmOp] | None = None,
     symprec: float = 0.01,
     dist_tol_factor: float = 1.0,
+    give_input_stabiliser: bool = False,
     give_point_group: bool = False,
 ) -> tuple[list[list[PeriodicSite]], list[SymmOp]] | tuple[list[list[PeriodicSite]], list[SymmOp], str]:
     """
     Get the orbit and stabiliser of a defect complex, given a primitive
-    structure. The order of sites is maintained from input to output, and the
-    first complex in the orbit corresponds to the input.
+    structure. The order of sites within each complex is maintained from input
+    to output.
+
+    The orbit is deterministically sorted (independent of the input
+    configuration and constituent ordering), such that ``orbit[0]`` is a consistent
+    representative of the orbit, returned if any element of the orbit were input.
+    The returned stabiliser corresponds to this representative by default, or to the
+    input configuration if ``give_input_stabiliser=True``.
 
     Args:
         point_defects (list[PeriodicSite]):
@@ -1436,6 +1532,10 @@ def get_complex_orbit_and_stabiliser(
         dist_tol_factor (float):
             Factor by which symprec is multiplied to give the distance
             tolerance for clustering equal complexes. (Default: 1.0)
+        give_input_stabiliser (bool):
+            Whether the returned stabiliser should correspond to the input
+            configuration (``True``) rather than the canonical representative
+            (``orbit[0]``; ``False``). (Default: False)
         give_point_group (bool):
             Whether to also return the Schoenflies point group symbol of the
             complex (i.e. of the stabiliser). (Default: False)
@@ -1443,10 +1543,13 @@ def get_complex_orbit_and_stabiliser(
     Returns:
         tuple[list[list[PeriodicSite]], list[SymmOp]] | tuple[list[list[PeriodicSite]], list[SymmOp], str]:
             The orbit and stabiliser of the complex in the crystal, per primitive
-            lattice cell. If ``give_point_group`` is ``True``, the Schoenflies
-            point group symbol of the complex is also returned as a third element.
-            All elements of the orbit are given in the unit primitive cell (i.e.
-            with complex centroids translated to lie within the unit cell).
+            lattice cell. The orbit is deterministically sorted, and the
+            stabiliser corresponds to the canonical representative configuration
+            (``orbit[0]``) by default (see ``give_input_stabiliser``). If
+            ``give_point_group`` is ``True``, the Schoenflies point group symbol
+            of the complex is also returned as a third element. All elements of
+            the orbit are given in the unit primitive cell (i.e. with complex
+            centroids translated to lie within the unit cell).
     """
     # get space group if not provided
     if quotient_ops is None:
@@ -1478,19 +1581,8 @@ def get_complex_orbit_and_stabiliser(
         [point_labels] * len(all_fcs), all_fcs, lattice, dist_tol=dist_tol
     )
 
-    # get orbit and stabiliser
-    stabiliser = [quotient_ops[i - 1] for i in cluster_indices[0] if i > 0]
+    # get orbit representatives (one configuration per cluster)
     fcs_orbit = [all_fcs[idx[0]] for idx in cluster_indices]
-
-    # check group theory results
-    coset_sizes = [len(idx) for idx in cluster_indices]
-    coset_sizes[0] -= 1  # take out duplicate initial complex
-    if any(size != len(stabiliser) for size in coset_sizes):
-        warnings.warn(
-            f"Unequal complex cluster (coset) sizes ({coset_sizes})."
-            f"Check the symmetry tolerances used (symprec = {symprec}, "
-            f"dist_tol = {dist_tol})."
-        )
 
     # recreate PeriodicSite objects
     orbit = []
@@ -1502,6 +1594,31 @@ def get_complex_orbit_and_stabiliser(
             new_sites.append(new_site)
         orbit.append(new_sites)
 
+    # sort the orbit deterministically, so orbit[0] is the representative element
+    orbit, _sort_index = _sort_complex_orbit(orbit)
+
+    # TODO just pick the right coset instead of redoing this
+    # get the stabiliser of either the input or the representative complex
+    if give_input_stabiliser:
+        target_fcs, target_transformed_fcs = point_fcs, transformed_fcs
+    else:
+        target_fcs = np.asarray([site.frac_coords for site in orbit[0]])
+        target_transformed_fcs = np.einsum("oij,nj->oni", rotations, target_fcs) + translations[:, None, :]
+        target_transformed_fcs -= np.floor(np.mean(target_transformed_fcs, axis=1, keepdims=True))
+    stabiliser = [
+        op
+        for op, op_fcs in zip(quotient_ops, target_transformed_fcs, strict=True)
+        if _complex_frac_coords_dist(point_labels, target_fcs, point_labels, op_fcs, lattice) <= dist_tol
+    ]
+
+    # check group theory results (orbit-stabiliser theorem):
+    if len(orbit) * len(stabiliser) != len(quotient_ops):
+        warnings.warn(
+            f"Orbit size ({len(orbit)}) x stabiliser size ({len(stabiliser)}) does not equal the number "
+            f"of symmetry operations ({len(quotient_ops)}). Check the symmetry tolerances used "
+            f"(symprec = {symprec}, dist_tol = {dist_tol})."
+        )
+
     if give_point_group:
         pg_ops = [np.rint(op.rotation_matrix).astype(int) for op in stabiliser]
         if (pointgroup := get_pointgroup(pg_ops)) is None:
@@ -1512,16 +1629,15 @@ def get_complex_orbit_and_stabiliser(
     return orbit, stabiliser
 
 
-def sort_complex_orbit(
+def _sort_complex_orbit(
     orbit: list[list[PeriodicSite]],
-    return_sort_index: bool = False,
     prec: int = 5,
-) -> list[list[PeriodicSite]] | tuple[list[list[PeriodicSite]], list[int]]:
+) -> tuple[list[list[PeriodicSite]], list[int]]:
     r"""
-    Deterministically sort the members of a defect complex orbit (e.g. as
-    output by ``get_complex_orbit_and_stabiliser``). The order of the point
-    defects within each complex on input is maintained, and the complex sort
-    order is independent of the order of these point defects.
+    Deterministically sort the members of a defect complex orbit (used within
+    ``get_complex_orbit_and_stabiliser``). The order of the point defects
+    within each complex on input is maintained, and the complex sort order is
+    independent of the order of these point defects.
 
     The sorting order is based on the point defects, but is not the same order as
     _sort_defects, and is intended only to give a deterministic output order of
@@ -1529,23 +1645,18 @@ def sort_complex_orbit(
 
     Args:
         orbit (list[list[PeriodicSite]]):
-            Orbit of a defect complex, as output by
-            ``get_complex_orbit_and_stabiliser`` (i.e. with all members
-            sharing a common constituent ordering, and centroids translated
-            to lie within the unit cell, and given relative to primitive cell).
-        return_sort_index (bool):
-            If ``True``, also return the list of indices which sorts the
-            input orbit members into the standard ordering.
+            Orbit of a defect complex (i.e. with all members sharing a common
+            constituent ordering, and centroids translated to lie within the
+            unit cell, and given relative to primitive cell).
         prec (int):
             Number of decimal places to which fractional coordinates are
             rounded for sort keys.
             (Default: 5)
 
     Returns:
-        list[list[PeriodicSite]] | tuple[list[list[PeriodicSite]], list[int]]:
-            The sorted orbit. If ``return_sort_index`` is ``True``, the
-            indices which sort the input orbit members are also returned,
-            as ``(sorted_orbit, sort_index)``.
+        tuple[list[list[PeriodicSite]], list[int]]:
+            The sorted orbit, and the indices which sort the input orbit
+            members, as ``(sorted_orbit, sort_index)``.
     """
     labels = [site.species_string for site in orbit[0]]
 
@@ -1565,6 +1676,4 @@ def sort_complex_orbit(
     sort_index = sorted(range(len(orbit)), key=lambda k: _member_key(orbit[k]))
     sorted_orbit = [orbit[k] for k in sort_index]
 
-    if return_sort_index:
-        return sorted_orbit, sort_index
-    return sorted_orbit
+    return sorted_orbit, sort_index

@@ -6,6 +6,7 @@ import collections
 import contextlib
 import warnings
 from collections.abc import Iterable
+from copy import deepcopy
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, cast
 
@@ -14,6 +15,7 @@ from monty.serialization import dumpfn, loadfn
 from pymatgen.analysis.defects import core, thermo, utils
 from pymatgen.core.bond_valence import BVAnalyzer
 from pymatgen.core.entries import ComputedEntry, ComputedStructureEntry
+from pymatgen.core.operations import SymmOp
 from pymatgen.core.periodic_table import DummySpecies
 from pymatgen.core.structure_matcher import ElementComparator, SpeciesComparator
 from pymatgen.io.vasp.outputs import Locpot, Outcar, Procar, Vasprun
@@ -2319,6 +2321,7 @@ class Defect(core.Defect):
         else:
             self.oxi_state = oxi_state
 
+        self.map_to_unit_cell = map_to_unit_cell  # store to keep relative sites for serialisation
         self.conventional_structure: Structure | None = doped_kwargs.get("conventional_structure")
         self.conv_cell_frac_coords: np.ndarray | None = doped_kwargs.get("conv_cell_frac_coords")
         self.equiv_conv_cell_frac_coords: list[np.ndarray] = doped_kwargs.get(
@@ -2850,6 +2853,10 @@ class Defect(core.Defect):
         if self is other:
             return True
 
+        # pmg DefectComplex raises AttributeError
+        if isinstance(other, core.DefectComplex):
+            return False
+
         if self.defect_type != other.defect_type or self.name != other.name:
             return False
 
@@ -3078,6 +3085,7 @@ def defect_structure_from_sites(
     return defect_struct
 
 
+# TODO doped DefectComplex from pmg DefectComplex
 def doped_defect_from_pmg_defect(
     defect: core.Defect, bulk_oxi_states: Structure | Composition | dict | bool = False, **doped_kwargs
 ):
@@ -3193,43 +3201,172 @@ class Interstitial(Defect, core.Interstitial):
         return f"{self.name} interstitial defect at site [{frac_coords_string}] in structure"
 
 
+# TODO check MRO
+# TODO check if stabiliser still needed
 class DefectComplex(core.DefectComplex, Defect):
+    """
+    ``doped`` ``DefectComplex`` object, defining a complex of point defects
+    (e.g. vacancy-substitution pairs) in a given host structure.
+
+    The complex is defined by its constituent point defects (``doped``
+    |Defect| objects), whose sites share a common host structure frame and
+    are kept `unwrapped` (i.e. not individually mapped back to the unit
+    cell), such that the relative geometry of the complex is preserved.
+    The complex ``site`` is the (dummy species) centroid of the constituent
+    defect sites.
+    """
+
     def __init__(
         self,
         defects: list[Defect],
         oxi_state: float | str | None = None,
-        equivalent_complexes: list[PeriodicSite] | None = None,
+        multiplicity: int | None = None,
+        equivalent_complexes: list[list[PeriodicSite]] | None = None,
+        stabiliser: list[SymmOp] | None = None,
+        map_to_unit_cell: bool = True,
         **doped_kwargs,
     ):
         """
         Subclass of :class:`~pymatgen.analysis.defects.core.DefectComplex` with
         additional attributes and methods used by ``doped``.
 
-        Temp notes:
-        DefectComplex.site -> DummySpecies at centroid
-        Defect.site -> relative site of defect, possibly not in unit cell
-        equivalent_sites always naive equivalent sites, ignoring complex
-        equivalent_complexes -> relative sites, possibly not in unit cell
+        Args:
+            defects (list[Defect]):
+                List of constituent point defect objects (sharing the same
+                host ``structure``), with (unwrapped) sites defining the
+                complex geometry. Constituents should generally be consistent as
+                `standalone` point defect objects, except that ``site`` may lie
+                outside the unit cell.
+            oxi_state (float, int or str):
+                The oxidation state of the defect complex. If not specified,
+                this is set to the sum of the constituent point defect
+                oxidation states (or ``"Undetermined"`` if any of these are
+                non-numeric).
+            multiplicity (int):
+                The multiplicity of the defect complex in ``structure``. If
+                not specified, this is automatically calculated using
+                ``get_multiplicity()``.
+            equivalent_complexes (list[list[PeriodicSite]]):
+                List of the symmetry-equivalent configurations of the
+                complex in the host structure, as lists of constituent sites
+                (with constituent ordering matching ``defects``, and each
+                configuration rigidly translated such that its centroid lies
+                within the unit cell); e.g. as output by
+                ``doped.complexes.get_complex_orbit_and_stabiliser``.
+                (NOTE currently these always as generated lie in primitive frame
+                regardless of self.structure which may be a supercell...
+                )
+            stabiliser (list[SymmOp]):
+                The stabiliser of the complex, a subgroup of the space group of
+                the host structure.
+            map_to_unit_cell (bool):
+                Whether to transform the defect complex site, as well as
+                the constituent point defect sites, to the unit cell, by an integer
+                lattice vector.
+            **doped_kwargs:
+                Additional keyword arguments to define doped-specific
+                attributes (see |Defect| docstring), applied to the complex
+                itself, `not` to the constituent point defects (e.g.
+                ``symprec``, ``user_charges``, ``wyckoff`` etc.).
         """
+        # derived attributes popped if coming from dict
+        for derived_attr in ("structure", "site"):
+            doped_kwargs.pop(derived_attr, None)
+
+        if not defects:
+            raise ValueError("A `DefectComplex` requires at least one constituent point defect.")
+        if any(defect.structure != defects[0].structure for defect in defects[1:]):
+            raise ValueError(
+                "All constituent point defects of a `DefectComplex` must share the same host structure."
+            )
+
+        # TODO sort on init?
         self.defects = defects
         self.equivalent_complexes = equivalent_complexes
+        self.stabiliser = stabiliser
         self.structure = defects[0].structure
-        centroid_fc = np.mean([point_defect.site.frac_coords for point_defect in defects], axis=0)
+        centroid_frac_coords = np.mean([defect.site.frac_coords for defect in defects], axis=0)
+
+        # rigid translation of the whole complex back to unit cell
+        if map_to_unit_cell:
+            centroid_cell = np.floor(centroid_frac_coords)
+            if np.any(centroid_cell):
+                centroid_frac_coords += -centroid_cell
+                for defect in self.defects:
+                    translated_site = deepcopy(defect.site)
+                    translated_site.frac_coords = defect.site.frac_coords - centroid_cell
+                    defect.site = translated_site  # invalidate old site...?
+
         centroid_site = PeriodicSite(
-            species=DummySpecies(),
-            coords=centroid_fc,
-            lattice=self.structure.lattice,
+            species=DummySpecies(), coords=centroid_frac_coords, lattice=self.structure.lattice
         )
-        calc_multiplicity = "multiplicity" not in doped_kwargs
-        doped_kwargs.setdefault("multiplicity", 1)  # see Interstitial
+
         Defect.__init__(
-            self, structure=defects[0].structure, site=centroid_site, oxi_state=oxi_state, **doped_kwargs
+            self,
+            structure=self.structure,
+            site=centroid_site,
+            multiplicity=multiplicity or 1,  # placeholder if not set, computed below (like Interstitial)
+            oxi_state=oxi_state,
+            map_to_unit_cell=False,  # already mapped if necessary
+            **doped_kwargs,
         )
-        if calc_multiplicity:
+        if multiplicity is None:
             self.multiplicity = self.get_multiplicity()
 
-        # TODO: map to unit cell consistently
+    def _set_oxi_state(self):
+        """
+        Set the oxidation state of the defect complex, as the sum of the
+        constituent point defect oxidation states (``_guess_oxi_state()``).
+        """
+        self.oxi_state = self._guess_oxi_state()
 
+    # override pymatgen - error for non-numeric oxi states
+    def _guess_oxi_state(self) -> float | str:
+        """
+        If all oxidation states are given, calculate the complex oxidation
+        state as the sum.
+
+        If not, the oxidation state is left as Undetermined."
+        """
+        oxi_state = 0.0
+        for defect in self.defects:
+            if not isinstance(defect.oxi_state, int | float):
+                warnings.warn(
+                    f"Constituent point defect {defect.name} of {self.name} has a non-numeric oxidation "
+                    f"state ({defect.oxi_state!r}), so the complex oxidation state is set to "
+                    f"'Undetermined'."
+                )
+                return "Undetermined"
+            oxi_state += defect.oxi_state
+        return oxi_state
+
+    # override pymatgen - AttributeError as DefectComplex name is not Other
+    @property
+    def defect_type(self) -> core.DefectType:
+        """
+        The defect type of a complex is defined as ``Other``.
+        """
+        return core.DefectType.Other
+
+    @property
+    def defect_site(self) -> PeriodicSite:
+        """
+        The defect site of the complex in the structure: the (dummy species)
+        centroid of the constituent point defect sites (i.e. ``self.site``).
+        """
+        return self.site
+
+    # TODO proper naming
+    @property
+    def name(self) -> str:
+        """
+        Name of the defect complex: the joined names of the constituent point
+        defects (in input order), e.g. ``"v_Cd+Te_Cd"``.
+        """
+        return "+".join(defect.name for defect in self.defects)
+
+    # TODO note currently equivalent_complexes are stored in primitive - should
+    # we transform back before storing
     def get_multiplicity(
         self,
         primitive_structure: Structure | None = None,
@@ -3238,18 +3375,169 @@ class DefectComplex(core.DefectComplex, Defect):
         **kwargs,
     ) -> int:
         """
-        Temporary multiplicity of the defect complex to override
-        core.DefectComplex.
+        Calculate the multiplicity of the defect complex.
+
+        If ``self.structure`` is a supercell (i.e. not the primitive host
+        cell), the complex sites are first unwrapped and folded into the
+        primitive cell (via ``complexes.unwrap_and_transform_to_prim``)
+        before determining the orbit.
+
+        The multiplicity is the size of the orbit of the complex
+        configuration under the host structure symmetry operations:
+        ``self.equivalent_complexes`` if set, otherwise
+        computed by ``doped`` (``get_complex_orbit_and_stabiliser``),
+        in which case the computed orbit (as well as the stabiliser)
+        is stored for the DefectComplex object.
+
+        Args:
+            primitive_structure (|Structure| | None):
+                Primitive bulk structure, else it will be derived from
+                self.structure.
+            symprec (float):
+                Symmetry precision for determining the host structure
+                symmetry operations, and thus equivalent complex
+                configurations. Default is ``None``, which uses
+                ``self.symprec`` (``0.01`` by default).
+            dist_tol_factor (float):
+                Distance tolerance for clustering equivalent complex
+                configurations, as a multiplicative factor of ``symprec``.
+                Default is 1.0.
+            **kwargs:
+                Additional keyword arguments. |StructureMatcher| keyword
+                arguments (``ltol``, ``stol``, ``angle_tol``, ``min_stol``,
+                ``max_stol``, ``stol_factor``, ``comparator``) are routed to
+                ``unwrap_and_transform_to_prim`` for the supercell ->
+                primitive transformation; any others (e.g. ``quotient_ops``)
+                are passed to ``get_complex_orbit_and_stabiliser``.
+
+        Returns:
+            int: The multiplicity of the complex (orbit size in the
+            primitive host cell).
         """
-        if self.equivalent_complexes is not None:
+        # TODO we actually don't do this for doped Defect
+        if self.equivalent_complexes:
             return len(self.equivalent_complexes)
-        return 1
-        # TODO: compute multiplicity
+
+        from doped.complexes import get_complex_orbit_and_stabiliser, unwrap_and_transform_to_prim
+        from doped.utils.symmetry import get_primitive_structure
+
+        assert isinstance(self.structure, Structure)
+        primitive_structure = primitive_structure or get_primitive_structure(
+            self.structure,
+            symprec=symprec or self.symprec,
+        )
+
+        # StructureMatcher kwargs to the supercell to primitive transformation:
+        sm_kwargs = {
+            k: kwargs.pop(k)
+            for k in ("ltol", "stol", "angle_tol", "min_stol", "max_stol", "stol_factor", "comparator")
+            if k in kwargs
+        }
+
+        # fold complex sites into the primitive cell if self.structure is a supercell:
+        defect_sites = [defect.site for defect in self.defects]
+        if primitive_structure != self.structure:
+            defect_sites = unwrap_and_transform_to_prim(
+                bulk_supercell=self.structure,
+                sites=defect_sites,
+                primitive_structure=primitive_structure,
+                symprec=symprec or self.symprec,
+                **sm_kwargs,
+            )
+
+        orb_stab = get_complex_orbit_and_stabiliser(
+            defect_sites,
+            primitive_structure,
+            symprec=symprec or self.symprec,
+            dist_tol_factor=dist_tol_factor,
+            give_input_stabiliser=True,  # the stabiliser of the actual stored complex
+            **kwargs,
+        )
+        orbit, stabiliser = orb_stab[0], orb_stab[1]
+        self.equivalent_complexes = orbit
+        if self.stabiliser is None:
+            self.stabiliser = stabiliser
+        return len(orbit)
+
+    # TODO we check for equivalent complexes but not equivalent structures?
+    # TODO switch to structurematcher once defect_structure is done?
+    def __eq__(self, other) -> bool:
+        """
+        Determine whether two ``DefectComplex`` objects are equal.
+
+        Two complexes are equal if they have  identical host structures (not
+        just equivalent), and the two complexes are symmetry-equivalent, i.e.
+        related by a space group operation of the structure.
+        """
+        if not isinstance(other, core.Defect):
+            raise TypeError("Can only compare `Defect`s with `Defect`s!")
+        if not isinstance(other, core.DefectComplex):
+            return False  # unless we want to check if point defect = complex with one constituent?
+        if self is other:
+            return True
+        if (
+            sorted(defect.name for defect in self.defects)
+            != sorted(defect.name for defect in other.defects)
+            or self.structure != other.structure
+        ):
+            return False
+
+        dist_tol = self.symprec
+
+        # check against equivalent complexes
+        from doped.complexes import is_periodic_image
+
+        if not self.equivalent_complexes:
+            self.get_multiplicity()  # computes and stores equivalent_complexes
+        other_sites = [defect.site for defect in other.defects]
+        return any(
+            is_periodic_image(other_sites, member, dist_tol=dist_tol)
+            for member in self.equivalent_complexes or []
+        )
+
+    # TODO? shouldn't eq be more discriminating than hash? what about doped Defect?
+    def __hash__(self):
+        """
+        Hash the ``DefectComplex`` object, based on the sorted constituent
+        point defect names and the hashed host structure.
+
+        Equal complexes always have equal hashes (unequal complexes may share a
+        hash)?
+        """
+        return hash(
+            (
+                tuple(sorted(defect.name for defect in self.defects)),
+                hash(self.structure),
+            )
+        )
+
+    def get_supercell_structure(self, *args, **kwargs) -> Structure:
+        """
+        Generate the simulation supercell for the defect complex.
+
+        Not yet implemented for ``DefectComplex`` objects.
+        """
+        raise NotImplementedError(
+            "Supercell structure generation for defect complexes is not yet implemented!"
+        )
 
     def __repr__(self) -> str:
         """
-        String representation of a complex defect.
+        String representation of the defect complex.
         """
+        frac_coords_string = ",".join(f"{x:.3f}" for x in self.site.frac_coords)
         return (
-            f"Complex defect containing: [{', '.join(str(point_defect) for point_defect in self.defects)}]"
+            f"{self.name} defect complex at centroid site [{frac_coords_string}], with constituents "
+            f"[{', '.join(defect.name for defect in self.defects)}] in structure"
         )
+
+    def defect_structure(self) -> Structure:
+        """
+        Generate the defect structure for the defect complex.
+
+        Not yet implemented for ``DefectComplex`` objects. Note - the input
+        cell Defect.structure (eg primitive) may be too small for the complex - then
+        a supercell will have to be generated? Should we do minimal supercell? But risk
+        non-symmomorphic elements appearing in defect_structure - probably not an issue?
+        """
+        raise NotImplementedError("Structure generation for defect complexes is not yet implemented.")
