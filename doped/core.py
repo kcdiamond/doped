@@ -3201,7 +3201,6 @@ class Interstitial(Defect, core.Interstitial):
         return f"{self.name} interstitial defect at site [{frac_coords_string}] in structure"
 
 
-# TODO check MRO
 # TODO check if stabiliser still needed
 class DefectComplex(core.DefectComplex, Defect):
     """
@@ -3253,12 +3252,10 @@ class DefectComplex(core.DefectComplex, Defect):
                 configuration rigidly translated such that its centroid lies
                 within the unit cell); e.g. as output by
                 ``doped.complexes.get_complex_orbit_and_stabiliser``.
-                (NOTE currently these always as generated lie in primitive frame
-                regardless of self.structure which may be a supercell...
-                )
             stabiliser (list[SymmOp]):
                 The stabiliser of the complex, a subgroup of the space group of
                 the host structure.
+                NOTE temporary? and of primitive always
             map_to_unit_cell (bool):
                 Whether to transform the defect complex site, as well as
                 the constituent point defect sites, to the unit cell, by an integer
@@ -3317,28 +3314,26 @@ class DefectComplex(core.DefectComplex, Defect):
         """
         Set the oxidation state of the defect complex, as the sum of the
         constituent point defect oxidation states (``_guess_oxi_state()``).
-        """
-        self.oxi_state = self._guess_oxi_state()
 
-    # override pymatgen - error for non-numeric oxi states
-    def _guess_oxi_state(self) -> float | str:
+        If any oxidation states of the constituent point defects are non-
+        numeric, sets the oxidation state as Undetermined.
         """
-        If all oxidation states are given, calculate the complex oxidation
-        state as the sum.
-
-        If not, the oxidation state is left as Undetermined."
-        """
-        oxi_state = 0.0
-        for defect in self.defects:
-            if not isinstance(defect.oxi_state, int | float):
-                warnings.warn(
-                    f"Constituent point defect {defect.name} of {self.name} has a non-numeric oxidation "
-                    f"state ({defect.oxi_state!r}), so the complex oxidation state is set to "
-                    f"'Undetermined'."
-                )
-                return "Undetermined"
-            oxi_state += defect.oxi_state
-        return oxi_state
+        # don't send non-numeric oxi states to pymatgen _guess_oxi_state
+        undetermined_defects = [
+            (defect.name, defect.oxi_state)
+            for defect in self.defects
+            if not isinstance(defect.oxi_state, int | float)
+        ]
+        if any(undetermined_defects):
+            self.oxi_state = "Undetermined"
+            undet_names, undet_oxi = zip(*undetermined_defects, strict=True)
+            warnings.warn(
+                f"Constituent point defects {', '.join(undet_names)} of {self.name} have "
+                f"non-numeric oxidation states ({', '.join(map(str, undet_oxi))}), so the complex "
+                f"oxidation state is set to 'Undetermined'."
+            )
+        else:
+            self.oxi_state = self._guess_oxi_state()
 
     # override pymatgen - AttributeError as DefectComplex name is not Other
     @property
@@ -3348,7 +3343,7 @@ class DefectComplex(core.DefectComplex, Defect):
         """
         return core.DefectType.Other
 
-    @property
+    @cached_property
     def defect_site(self) -> PeriodicSite:
         """
         The defect site of the complex in the structure: the (dummy species)
@@ -3366,7 +3361,9 @@ class DefectComplex(core.DefectComplex, Defect):
         return "+".join(defect.name for defect in self.defects)
 
     # TODO note currently equivalent_complexes are stored in primitive - should
-    # we transform back before storing
+    # we transform back before storing? store all equivalent in supercell? could be a lot?
+    # transform symmops to supercell?
+    # copy to all equivalent sites and wrap?
     def get_multiplicity(
         self,
         primitive_structure: Structure | None = None,
@@ -3473,7 +3470,7 @@ class DefectComplex(core.DefectComplex, Defect):
             raise TypeError("Can only compare `Defect`s with `Defect`s!")
         if not isinstance(other, core.DefectComplex):
             return False  # unless we want to check if point defect = complex with one constituent?
-        if self is other:
+        if self is other or hash(self) == hash(other):
             return True
         if (
             sorted(defect.name for defect in self.defects)
@@ -3482,7 +3479,7 @@ class DefectComplex(core.DefectComplex, Defect):
         ):
             return False
 
-        dist_tol = self.symprec
+        dist_tol = self.symprec  # ?
 
         # check against equivalent complexes
         from doped.complexes import is_periodic_image
@@ -3501,15 +3498,10 @@ class DefectComplex(core.DefectComplex, Defect):
         Hash the ``DefectComplex`` object, based on the sorted constituent
         point defect names and the hashed host structure.
 
-        Equal complexes always have equal hashes (unequal complexes may share a
-        hash)?
+        In this implementation, equal hashes implies equal complexes, but equal
+        complexes may have unequal hashes.
         """
-        return hash(
-            (
-                tuple(sorted(defect.name for defect in self.defects)),
-                hash(self.structure),
-            )
-        )
+        return hash((tuple(sorted([hash(defect) for defect in self.defects])),))
 
     def get_supercell_structure(self, *args, **kwargs) -> Structure:
         """
