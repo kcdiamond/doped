@@ -51,6 +51,7 @@ from doped.utils.parsing import (
     _compare_incar_tags,
     _compare_kpoints,
     _compare_potcar_symbols,
+    _create_unrelaxed_complex_structure,
     _create_unrelaxed_defect_structure,
     _determine_subfolder,
     _find_calc_outputs,
@@ -317,18 +318,19 @@ def defect_site_from_structures(
     )
 
 
-# TODO: should guessed_initial_defect_structure and unrelaxed_defect_structure be given for each defect?
-# does it make more sense to have a single initial/unrelaxed defect structure for all defects
 def defect_sites_from_structures(
     defect_supercell: Structure,
     bulk_supercell: Structure,
-    return_all_info: bool = False,
+    return_point_info: bool = False,
+    return_complex_info: bool = False,
     _parameter_order_warn: bool = True,
 ) -> (
     list[PeriodicSite]
+    | list[tuple[PeriodicSite, str, PeriodicSite, int | None, int | None, Structure, Structure]]
+    | tuple[list[PeriodicSite], Structure]
     | tuple[
-        list[PeriodicSite],
         list[tuple[PeriodicSite, str, PeriodicSite, int | None, int | None, Structure, Structure]],
+        Structure,
     ]
 ):
     """
@@ -344,9 +346,13 @@ def defect_sites_from_structures(
             Defect structure to use for identifying the defect site.
         bulk_supercell (|Structure|):
             Bulk supercell structure.
-        return_all_info (bool):
-            If ``True``, returns additional info related to the site-matching;
-            see return signature. (Default: ``False``)
+        return_point_info (bool):
+            Whether to return a tuple containing all information about
+            each point defect (see Returns) instead of just the site, for
+            each point defect (Default: ``False``)
+        return_complex_info (bool):
+            If ``True``, additionally returns all information about the
+            defect as a complex. (Default: ``False``)
 
     Returns:
         list[|PeriodicSite|]:
@@ -357,8 +363,16 @@ def defect_sites_from_structures(
             defect supercell) it is the vacated site from the (unrelaxed)
             `bulk` supercell.
 
-    If ``return_all_info`` is True, then also returns a list of tuples, where each
-    tuple contains the following for each defect site:
+    If ``return_point_info`` is ``True``, then ``all_point_defects_info`` (described
+    below) is returned in place of the |PeriodicSite| list. If
+    ``return_complex_info`` is ``True``, then ``unrelaxed_complex_structure`` is
+    additionally returned. So, with both flags set an
+    ``(all_point_defects_info, unrelaxed_complex_structure)`` tuple is returned, and
+    with only ``return_complex_info`` a ``(defect_sites, unrelaxed_complex_structure)``
+    tuple is returned.
+
+    ``all_point_defects_info`` (returned if ``return_point_info`` is ``True``) is a
+    list of tuples, where each tuple contains the following for each defect site:
         defect_site (|PeriodicSite|):
             ``pymatgen`` |PeriodicSite| object of the defect site in the
             `defect` supercell (as above).
@@ -382,35 +396,30 @@ def defect_sites_from_structures(
         unrelaxed_defect_structure (|Structure|):
             ``pymatgen`` |Structure| object of the unrelaxed defect
             structure.
+
+    ``unrelaxed_complex_structure`` (returned if ``return_complex_info`` is
+    ``True``) is the ``pymatgen`` |Structure| object of the guessed unrelaxed
+    defect complex structure.
     """
     if _parameter_order_warn:
         _warn_parameter_order("defect_site_from_structures")  # TODO: Remove in doped v4.1
-    try:  # automatic defect site detection -- this gives us the "unrelaxed" defect structure
-        point_defects = get_point_defect_types_and_site_indices(defect_supercell, bulk_supercell)
-        # WHY IS THE FOLLOWING IN TRY
-        # bulk_site_index = missing_bulk_site_indices[0] if missing_bulk_site_indices else None
-        # defect_site_index = additional_defect_site_indices[0] if additional_defect_site_indices else None
-        # unrelaxed_defect_structure = _create_unrelaxed_defect_structure(
-        #     defect_supercell,
-        #     bulk_supercell,
-        #     defect_site_idx=defect_site_index,
-        #     bulk_site_idx=bulk_site_index,
-        #     defect_coords=defect_type == "interstitial",
-        # )
 
-    except RuntimeError as exc:
+    # get point defects
+    point_defects = get_point_defect_types_and_site_indices(defect_supercell, bulk_supercell)
+
+    check_condition = False  # TODO on what condition should atom mapping far from defect be checked
+    if check_condition:
         check_atom_mapping_far_from_defect(
             defect_supercell,
             bulk_supercell,
             guess_defect_position(defect_supercell, bulk_supercell),
             coords_are_cartesian=True,
         )
-        defect_type = ""  # TODO: what's going on with the try statement
         raise RuntimeError(
-            f"Could not identify {defect_type} defect site in defect structure. Please check that your "
-            f"defect supercells are reasonable, and that they match the bulk supercell. If so, "
-            f"and this error is not resolved, please report this issue to the developers."
-        ) from exc
+            "Could not identify defect sites in defect structure. Please check that your "
+            "defect supercells are reasonable, and that they match the bulk supercell. If so, "
+            "and this error is not resolved, please report this issue to the developers."
+        )
 
     defect_sites = [
         defect_supercell[defect_site_index]
@@ -419,13 +428,17 @@ def defect_sites_from_structures(
         for defect_type, bulk_site_index, defect_site_index in point_defects
     ]
 
-    if not return_all_info:
+    if not (return_point_info or return_complex_info):
         return defect_sites
 
-    all_defects_info = []
+    if not return_point_info:
+        unrelaxed_complex_structure = _create_unrelaxed_complex_structure(
+            defect_supercell, bulk_supercell, point_defects
+        )
+        return defect_sites, unrelaxed_complex_structure
 
+    all_point_defects_info = []
     for defect_type, bulk_site_index, defect_site_index in point_defects:
-        # TODO: should unrelaxed_defect_structure be in try statement?
         unrelaxed_defect_structure = _create_unrelaxed_defect_structure(
             defect_supercell,
             bulk_supercell,
@@ -474,7 +487,7 @@ def defect_sites_from_structures(
             if defect_site_in_bulk.distance_and_image_from_frac_coords(closest_cand_int_fcoords)[0] < 1:
                 defect_site_in_bulk = guessed_initial_defect_structure[defect_site_index]
 
-        all_defects_info.append(
+        all_point_defects_info.append(
             (
                 defect_site,
                 defect_type,
@@ -486,10 +499,13 @@ def defect_sites_from_structures(
             )
         )
 
-    return (
-        defect_sites,
-        all_defects_info,
-    )  # TODO: clean up output format?
+    if not return_complex_info:
+        return all_point_defects_info
+
+    unrelaxed_complex_structure = _create_unrelaxed_complex_structure(
+        defect_supercell, bulk_supercell, point_defects
+    )
+    return all_point_defects_info, unrelaxed_complex_structure  # TODO guessed initial structure
 
 
 def defect_complex_from_structures(
@@ -595,8 +611,8 @@ def defect_complex_from_structures(
         _warn_parameter_order("defect_from_structures")  # TODO: Remove in doped v4.1
 
     defect_sites_info = defect_sites_from_structures(
-        defect_supercell, bulk_supercell, return_all_info=True, _parameter_order_warn=False
-    )[1]
+        defect_supercell, bulk_supercell, return_point_info=True, _parameter_order_warn=False
+    )
     (
         defect_sites,
         defect_types,
