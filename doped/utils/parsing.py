@@ -1160,60 +1160,6 @@ def find_missing_idx(
     return next(iter(set(np.arange(len(superset), dtype=int)) - set(site_matches)))
 
 
-def _create_unrelaxed_defect_structure(
-    defect_supercell: Structure,
-    bulk_supercell: Structure,
-    defect_site_idx: int | None = None,
-    bulk_site_idx: int | None = None,
-    defect_coords: bool = False,
-) -> Structure:
-    """
-    Create the unrelaxed defect structure, which corresponds to the bulk
-    supercell with the unrelaxed defect site.
-
-    The unrelaxed defect site corresponds to the vacancy/substitution site in
-    the pristine (bulk) supercell for vacancies/substitutions, and the `final`
-    relaxed interstitial site for interstitials (as the assignment of their
-    initial site is ambiguous).
-
-    Args:
-        defect_supercell (Structure):
-            The defect structure.
-        bulk_supercell (Structure):
-            The bulk structure.
-        defect_site_idx (int):
-            The index of the defect site to use in the unreleaxed defect
-            structure. Just for consistency with the relaxed defect structure.
-        bulk_site_idx (int):
-            The index of the site in the bulk structure that corresponds to the
-            defect site in the defect structure.
-        defect_coords (bool):
-            Whether to use the fractional coordinates of the defect site in the
-            defect structure, or the bulk structure. Irrelevant for vacancies.
-            Parent functions in ``doped`` use ``True`` for interstitials, and
-            ``False`` for substitutions (i.e. use bulk site coords).
-
-    Returns:
-        Structure:
-            The unrelaxed defect structure.
-    """
-    unrelaxed_defect_structure = bulk_supercell.copy()  # create unrelaxed defect structure
-
-    if bulk_site_idx is not None:
-        unrelaxed_defect_structure.remove_sites([bulk_site_idx])
-
-    if defect_site_idx is not None:
-        defect_site_in_defect = defect_supercell[defect_site_idx]
-        if not defect_coords and bulk_site_idx is not None:
-            defect_coords = bulk_supercell[bulk_site_idx].frac_coords
-        else:
-            defect_coords = defect_site_in_defect.frac_coords
-
-        unrelaxed_defect_structure.insert(defect_site_idx, defect_site_in_defect.species, defect_coords)
-
-    return unrelaxed_defect_structure
-
-
 def _create_unrelaxed_complex_structure(
     defect_supercell: Structure,
     bulk_supercell: Structure,
@@ -1237,7 +1183,7 @@ def _create_unrelaxed_complex_structure(
         point_defects (list[tuple[str, int | None, int | None]]):
             List of tuples of (point defect type, bulk site index, defect
             site index), eg as returned by get_point_defect_types_and_site_indices.
-        defect_coords (bool):
+        defect_coords (list[bool]):
             Whether to use the fractional coordinates of the defect site in the
             defect structure, or the bulk structure. Irrelevant for vacancies.
             Parent functions in ``doped`` use ``True`` for interstitials, and
@@ -1250,7 +1196,7 @@ def _create_unrelaxed_complex_structure(
     """
     unrelaxed_defect_structure = bulk_supercell.copy()  # create unrelaxed defect structure
 
-    # to match defect_site_idxs
+    # to try to match defect_site_idxs
     point_defects = sorted(point_defects, key=lambda x: (x[2] is None, x[2]))
 
     # remove bulk sites
@@ -1301,7 +1247,7 @@ def get_wigner_seitz_radius(lattice: Structure | Lattice) -> float:
         distances[i] = abs(np.dot(a_i_a_j, a_k)) / np.linalg.norm(a_i_a_j)
     return max(distances) / 2.0
 
-
+# TODO different version for complex defects? or should still be ok outside WS radius? 
 def check_atom_mapping_far_from_defect(
     defect_supercell: Structure,
     bulk_supercell: Structure,

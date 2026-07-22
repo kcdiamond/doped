@@ -34,6 +34,7 @@ from doped.generation import (
     _get_element_list,
     get_defect_name_from_defect,
     get_defect_name_from_entry,
+    get_interstitial_sites,
     name_defect_entries,
     sort_defect_entries,
 )
@@ -407,7 +408,11 @@ def defect_sites_from_structures(
     # get point defects
     point_defects = get_point_defect_types_and_site_indices(defect_supercell, bulk_supercell)
 
-    check_condition = False  # TODO on what condition should atom mapping far from defect be checked
+    # condition for checking cell matching?
+    check_match_proportion = 0.25 # TODO ?
+    check_condition = (len(point_defects)/len(defect_supercell) > check_match_proportion
+        or len(point_defects)/len(bulk_supercell) > check_match_proportion)
+
     if check_condition:
         check_atom_mapping_far_from_defect(
             defect_supercell,

@@ -1449,6 +1449,7 @@ def unwrap_and_transform_to_prim(
     """
     from doped.utils.configurations import get_transformation_from_s2_to_s1
     from doped.utils.supercells import get_min_image_distance
+    from doped.utils.symmetry import _get_supercell_to_prim_fold_map
 
     if primitive_structure is None:
         primitive_structure = get_primitive_structure(bulk_supercell, symprec=symprec)
@@ -1477,16 +1478,23 @@ def unwrap_and_transform_to_prim(
 
     # TRANSFORM SUPERCELL TO PRIMITIVE CELL
 
-    # get transformation to primitive
-    sm_kwargs.setdefault("attempt_supercell", True)
-    sm_kwargs.setdefault("scale", False)
-    sc_matrix, trans_vector, _mapping = get_transformation_from_s2_to_s1(
-        bulk_supercell, primitive_structure, **sm_kwargs
-    )
-    sc_matrix = np.asarray(sc_matrix)
-    offset = -np.asarray(trans_vector) @ sc_matrix
-    # get offset such that centroid lands in unit primitive
-    offset -= np.floor(np.mean(unwrapped_fc, axis=0) @ sc_matrix + offset)
+    # try prim fold map, else fallback to StructureMatcher?
+    fold_map = _get_supercell_to_prim_fold_map(bulk_supercell, primitive_structure, symprec=symprec)
+    if fold_map is not None:
+        M, translation = fold_map
+        sc_matrix = np.asarray(M)
+        offset = np.asarray(translation)
+    else:
+        sm_kwargs.setdefault("attempt_supercell", True)
+        sm_kwargs.setdefault("scale", False)
+        sc_matrix, trans_vector, _mapping = get_transformation_from_s2_to_s1(
+            bulk_supercell, primitive_structure, **sm_kwargs
+        )
+        sc_matrix = np.asarray(sc_matrix)
+        offset = -np.asarray(trans_vector) @ sc_matrix
+
+    # shift offset such that the centroid lands in the unit primitive cell:
+    offset = offset - np.floor(np.mean(unwrapped_fc, axis=0) @ sc_matrix + offset)
 
     # recreate sites in primitive
     rel_obj_fcs = [sc_fc @ sc_matrix + offset for sc_fc in unwrapped_fc]
@@ -1619,6 +1627,7 @@ def get_complex_orbit_and_stabiliser(
             f"(symprec = {symprec}, dist_tol = {dist_tol})."
         )
 
+    # TODO align with new local_point_symmetry methods - eg schoenflies from cartesian ops etc
     if give_point_group:
         pg_ops = [np.rint(op.rotation_matrix).astype(int) for op in stabiliser]
         if (pointgroup := get_pointgroup(pg_ops)) is None:
