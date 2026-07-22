@@ -26,7 +26,7 @@ from pymatgen.core.structure_matcher import get_linear_assignment_solution, pbc_
 from pymatgen.electronic_structure.core import Spin
 from pymatgen.io.vasp.inputs import POTCAR_STATS_PATH, UnknownPotcarWarning
 from pymatgen.io.vasp.outputs import Locpot, Outcar, Procar, Vasprun, _parse_vasp_array
-from pymatgen.util.coord import all_distances
+from pymatgen.util.coord import all_distances, lattice_points_in_supercell
 from pymatgen.util.typing import PathLike, SpeciesLike
 
 from doped.utils import _warn_parameter_order
@@ -1029,6 +1029,44 @@ def _create_unrelaxed_defect_structure(
     return unrelaxed_defect_structure
 
 
+def _get_interstitials_fc_via_prim(
+    bulk_supercell: Structure, symprec: float = 0.01, **interstitial_gen_kwargs
+) -> np.ndarray:
+    """
+    Temporary wrapper for get_interstitial_sites - tries to fold to primitive and get
+    interstitial sites there then transform back, like get_all_equiv_sites, for
+    efficiency. Because full get_interstitial_sites is used now in parsing on
+    supercells, unlike in generation (only on primitive).
+
+    Returns:
+        np.ndarray:
+            ``(N, 3)`` array of candidate interstitial fractional coordinates
+            in ``bulk_supercell``.
+    """
+    from doped.generation import get_interstitial_sites
+    from doped.utils.symmetry import _get_supercell_to_prim_fold_map, get_primitive_structure
+
+    primitive = get_primitive_structure(bulk_supercell, symprec=symprec)
+    fold_map = (
+        _get_supercell_to_prim_fold_map(bulk_supercell, primitive, symprec=symprec)
+        if len(primitive) < len(bulk_supercell)
+        else None
+    )  # None -> no clean map or already prim
+
+    # try interstitials in prim if clean map works
+    host = bulk_supercell if fold_map is None else primitive
+    equiv_fpos = np.array(
+        [fpos for *_, equiv in get_interstitial_sites(host, **interstitial_gen_kwargs) for fpos in equiv]
+    )
+    if fold_map is None:
+        return equiv_fpos
+
+    # unfold to supercell and add equiv points
+    M, translation = fold_map
+    cosets = lattice_points_in_supercell(M)
+    return ((equiv_fpos - translation) @ np.linalg.inv(M) + cosets[:, None]).reshape(-1, 3) % 1
+
+
 def _guess_initial_defect_structure(
     unrelaxed_defect_structure: Structure,
     bulk_supercell: Structure,
@@ -1058,17 +1096,11 @@ def _guess_initial_defect_structure(
     if defect_type != "interstitial":
         return guessed_initial_defect_structure, defect_site_in_bulk
 
-    from doped.generation import get_interstitial_sites
-
     # get closest candidate interstitial site in bulk supercell (based on default interstitial gen
     # settings) to the relaxed interstitial site, as this is likely the _initial_ interstitial site
     int_site = guessed_initial_defect_structure.pop(defect_site_index)
     int_gen_kwargs: dict[str, Any] = {"min_dist": 0.5} if int_site.species_string == "H" else {}
-    all_equiv_fpos = [  # all candidate interstitial frac coords in the bulk supercell
-        fpos
-        for *_, equiv_fpos in get_interstitial_sites(bulk_supercell, **int_gen_kwargs)
-        for fpos in equiv_fpos
-    ]
+    all_equiv_fpos = _get_interstitials_fc_via_prim(bulk_supercell, **int_gen_kwargs)
     closest_cand_int_fcoords = all_equiv_fpos[  # closest candidate interstitial frac coords
         np.argmin(bulk_supercell.lattice.get_all_distances(defect_site.frac_coords, all_equiv_fpos))
     ]
@@ -1114,7 +1146,7 @@ def _guess_initial_complex_structure(
             interstitial sites.
         interstitial_sites (list[PeriodicSite]):
             The relaxed interstitial sites.
-        interstitial_site_indices (list[int] | None):
+        interstitial_site_indices (list[int]):
             The indices of the interstitial sites in the defect supercell.
 
     Returns:
@@ -1128,20 +1160,17 @@ def _guess_initial_complex_structure(
     if not interstitial_sites:
         return guessed_initial_defect_structure, interstitial_sites_in_bulk
 
-    from doped.generation import get_interstitial_sites
+    # get candidate interstitials (for H present or not)
+    int_is_H = [site.species_string == "H" for site in interstitial_sites]
+    candidate_fpos = {
+        is_H: _get_interstitials_fc_via_prim(bulk_supercell, **({"min_dist": 0.5} if is_H else {}))
+        for is_H in set(int_is_H)
+    }
 
     # get closest candidate interstitials
     closest_candidate_list = []  # closest candidate interstitial frac coords in the bulk, per interstitial
-    for defect_site, defect_site_index in zip(interstitial_sites, interstitial_site_indices, strict=True):
-        # get closest candidate interstitial site in bulk supercell (based on default interstitial gen
-        # settings) to the relaxed interstitial site, as this is likely the _initial_ interstitial site
-        int_site = guessed_initial_defect_structure[defect_site_index]
-        int_gen_kwargs: dict[str, Any] = {"min_dist": 0.5} if int_site.species_string == "H" else {}
-        all_equiv_fpos = [
-            fpos
-            for *_, equiv_fpos in get_interstitial_sites(bulk_supercell, **int_gen_kwargs)
-            for fpos in equiv_fpos
-        ]
+    for defect_site, is_H in zip(interstitial_sites, int_is_H, strict=True):
+        all_equiv_fpos = candidate_fpos[is_H]
         closest_candidate_list.append(
             all_equiv_fpos[
                 np.argmin(
