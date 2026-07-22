@@ -17,7 +17,7 @@ from pymatgen.core.bond_valence import BVAnalyzer
 from pymatgen.core.entries import ComputedEntry, ComputedStructureEntry
 from pymatgen.core.operations import SymmOp
 from pymatgen.core.periodic_table import DummySpecies
-from pymatgen.core.structure_matcher import ElementComparator, SpeciesComparator
+from pymatgen.core.structure_matcher import SpeciesComparator
 from pymatgen.io.vasp.outputs import Locpot, Outcar, Procar, Vasprun
 from pymatgen.util.typing import PathLike
 from scipy.constants import value as constants_value
@@ -3366,9 +3366,9 @@ class DefectComplex(core.DefectComplex, Defect):
     # copy to all equivalent sites and wrap?
     def get_multiplicity(
         self,
-        primitive_structure: Structure | None = None,
         symprec: float | None = None,
         dist_tol_factor: float = 1.0,
+        primitive_structure: Structure | None = None,
         **kwargs,
     ) -> int:
         """
@@ -3387,9 +3387,6 @@ class DefectComplex(core.DefectComplex, Defect):
         is stored for the DefectComplex object.
 
         Args:
-            primitive_structure (|Structure| | None):
-                Primitive bulk structure, else it will be derived from
-                self.structure.
             symprec (float):
                 Symmetry precision for determining the host structure
                 symmetry operations, and thus equivalent complex
@@ -3399,6 +3396,9 @@ class DefectComplex(core.DefectComplex, Defect):
                 Distance tolerance for clustering equivalent complex
                 configurations, as a multiplicative factor of ``symprec``.
                 Default is 1.0.
+            primitive_structure (|Structure| | None):
+                Primitive bulk structure, else it will be derived from
+                self.structure.
             **kwargs:
                 Additional keyword arguments. |StructureMatcher| keyword
                 arguments (``ltol``, ``stol``, ``angle_tol``, ``min_stol``,
@@ -3492,7 +3492,6 @@ class DefectComplex(core.DefectComplex, Defect):
             for member in self.equivalent_complexes or []
         )
 
-    # TODO? shouldn't eq be more discriminating than hash? what about doped Defect?
     def __hash__(self):
         """
         Hash the ``DefectComplex`` object, based on the sorted constituent

@@ -746,11 +746,11 @@ def get_point_defect_types_and_site_indices(
             the distance threshold for matching is set to the product of
             ``site_tol`` and the shortest bond length in the bulk structure for
             the species at the bulk site, otherwise the value is used directly
-            (as a length in Å). Default is 0.5 (i.e. half the shortest bond
+            (as a length in Å). Default is 0.5 (i.e. half the shortest bond
             length in the bulk structure for the species at a bulk site).
         abs_tol (bool):
             Whether to use ``site_tol`` as an absolute distance tolerance (in
-            Å) instead of a fractional tolerance (in terms of the shortest bond
+            Å) instead of a fractional tolerance (in terms of the shortest bond
             length in the structure). Default is ``False``.
         use_oxi_states (bool):
             Whether to use the oxidation states of the sites in the bulk and
@@ -1087,6 +1087,107 @@ def _guess_initial_defect_structure(
     return guessed_initial_defect_structure, defect_site_in_bulk
 
 
+def _guess_initial_complex_structure(
+    unrelaxed_defect_structure: Structure,
+    bulk_supercell: Structure,
+    interstitial_sites: list[PeriodicSite],
+    interstitial_site_indices: list[int],
+) -> tuple[Structure, list[PeriodicSite]]:
+    """
+    Guess the initial defect structure, corresponding to
+    ``unrelaxed_defect_structure`` but with each interstitial placed at the
+    closest candidate interstitial site in the bulk supercell (based on default
+    ``doped`` interstitial generation settings) to the relaxed interstitial
+    site -- as this is likely the `initial` interstitial site.
+
+    Returns the guessed initial (unrelaxed) site for each interstitial: this is
+    the guessed initial site if it is within 1 Å of the relaxed site, otherwise
+    the relaxed site itself. Interstitials whose closest candidate site is
+    shared with another interstitial are not assigned (their relaxed sites are
+    kept, and a warning is issued).
+
+    Args:
+        unrelaxed_defect_structure (Structure):
+            The unrelaxed defect supercell structure.
+        bulk_supercell (Structure):
+            The bulk supercell structure, used to generate candidate
+            interstitial sites.
+        interstitial_sites (list[PeriodicSite]):
+            The relaxed interstitial sites.
+        interstitial_site_indices (list[int] | None):
+            The indices of the interstitial sites in the defect supercell.
+
+    Returns:
+        tuple[Structure, list[PeriodicSite]]:
+            The guessed initial defect structure, and the guessed initial
+            (unrelaxed) site for each interstitial.
+    """
+    guessed_initial_defect_structure = unrelaxed_defect_structure.copy()
+    interstitial_sites_in_bulk = list(interstitial_sites)  # copy
+
+    if not interstitial_sites:
+        return guessed_initial_defect_structure, interstitial_sites_in_bulk
+
+    from doped.generation import get_interstitial_sites
+
+    # get closest candidate interstitials
+    closest_candidate_list = []  # closest candidate interstitial frac coords in the bulk, per interstitial
+    for defect_site, defect_site_index in zip(interstitial_sites, interstitial_site_indices, strict=True):
+        # get closest candidate interstitial site in bulk supercell (based on default interstitial gen
+        # settings) to the relaxed interstitial site, as this is likely the _initial_ interstitial site
+        int_site = guessed_initial_defect_structure[defect_site_index]
+        int_gen_kwargs: dict[str, Any] = {"min_dist": 0.5} if int_site.species_string == "H" else {}
+        all_equiv_fpos = [
+            fpos
+            for *_, equiv_fpos in get_interstitial_sites(bulk_supercell, **int_gen_kwargs)
+            for fpos in equiv_fpos
+        ]
+        closest_candidate_list.append(
+            all_equiv_fpos[
+                np.argmin(
+                    bulk_supercell.lattice.get_all_distances(defect_site.frac_coords, all_equiv_fpos)
+                )
+            ]
+        )
+
+    # TODO draft prevent collisions between interstitials to same candidate - how likely is this actually?
+    # are there other similar issues?
+    closest_candidates = np.array(closest_candidate_list)
+    _vals, idxs, counts = np.unique(closest_candidates, axis=0, return_index=True, return_counts=True)
+    accepted_candidates = idxs[counts == 1]
+    rejected_candidates = [idx for idx in range(len(closest_candidates)) if idx not in accepted_candidates]
+
+    if rejected_candidates:
+        rejected_sites = [interstitial_sites[int_idx] for int_idx in rejected_candidates]
+        warnings.warn(
+            "The following relaxed interstitial(s) could not be assigned to guessed initial sites "
+            "(multiple relaxed interstitials mapped to the same candidate site), so their relaxed "
+            "sites are used instead:\n"
+            + "\n".join(f"  - {site.species_string} at {site.frac_coords}" for site in rejected_sites)
+        )
+
+    # only use guessed sites if only correspond to one relaxed interstitial
+    for int_idx in accepted_candidates:
+        defect_site = interstitial_sites[int_idx]
+        defect_site_index = interstitial_site_indices[int_idx]
+        closest_cand_int_fcoords = closest_candidates[int_idx]
+
+        int_site = guessed_initial_defect_structure.pop(defect_site_index)
+        guessed_initial_defect_structure.insert(
+            defect_site_index,  # place defect at same position as in supercell calculation
+            int_site.species_string,
+            closest_cand_int_fcoords,
+            coords_are_cartesian=False,
+            validate_proximity=True,
+        )
+        # if guessed initial site is sufficiently close to the relaxed site, then use it as
+        # "defect_site_in_bulk", otherwise use the relaxed site:
+        if defect_site.distance_and_image_from_frac_coords(closest_cand_int_fcoords)[0] < 1:
+            interstitial_sites_in_bulk[int_idx] = guessed_initial_defect_structure[defect_site_index]
+
+    return guessed_initial_defect_structure, interstitial_sites_in_bulk
+
+
 def find_nearest_coords(
     candidate_frac_coords: list | np.ndarray,
     target_frac_coords: list | np.ndarray,
@@ -1247,7 +1348,8 @@ def get_wigner_seitz_radius(lattice: Structure | Lattice) -> float:
         distances[i] = abs(np.dot(a_i_a_j, a_k)) / np.linalg.norm(a_i_a_j)
     return max(distances) / 2.0
 
-# TODO different version for complex defects? or should still be ok outside WS radius? 
+
+# TODO different version for complex defects? or should still be ok outside WS radius?
 def check_atom_mapping_far_from_defect(
     defect_supercell: Structure,
     bulk_supercell: Structure,
@@ -1377,8 +1479,8 @@ def check_atom_mapping_far_from_defect(
 def _get_site_mapping_from_coords_and_indices(
     s1_frac_coords: ArrayLike,
     s2_frac_coords: ArrayLike,
-    s1_indices: np.ndarray | None = None,
-    s2_indices: np.ndarray | None = None,
+    s1_indices: np.ndarray | list[int] | None = None,
+    s2_indices: np.ndarray | list[int] | None = None,
     lattice: Lattice | None = None,
     use_rms: bool = False,
 ) -> list[tuple[float | None, int | None, int | None]]:
