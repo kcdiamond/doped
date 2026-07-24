@@ -1486,9 +1486,14 @@ def unwrap_and_transform_to_prim(
     else:
         sm_kwargs.setdefault("attempt_supercell", True)
         sm_kwargs.setdefault("scale", False)
-        sc_matrix, trans_vector, _mapping = get_transformation_from_s2_to_s1(
-            bulk_supercell, primitive_structure, **sm_kwargs
-        )
+        transformation = get_transformation_from_s2_to_s1(bulk_supercell, primitive_structure, **sm_kwargs)
+        if transformation is None:  # no match to primitive
+            raise RuntimeError(
+                "Could not map the input structure onto the given primitive cell (no "
+                "``StructureMatcher`` match) - they likely do not correspond to the same structure. "
+                "Try passing without ``primitive_structure`` argument?"
+            )
+        sc_matrix, trans_vector, _mapping = transformation
         sc_matrix = np.asarray(sc_matrix)
         offset = -np.asarray(trans_vector) @ sc_matrix
 

@@ -3339,9 +3339,9 @@ class DefectComplex(core.DefectComplex, Defect):
     def name(self) -> str:
         """
         Name of the defect complex: the joined names of the constituent point
-        defects (in input order), e.g. ``"v_Cd+Te_Cd"``.
+        defects, sorted alphabetically by name, e.g. ``"Te_Cd+v_Cd"``.
         """
-        return "+".join(defect.name for defect in self.defects)
+        return "+".join(sorted(defect.name for defect in self.defects))
 
     def get_multiplicity(
         self,
@@ -3357,8 +3357,7 @@ class DefectComplex(core.DefectComplex, Defect):
         the complex in ``self.structure``.
 
         Uses ``self.equivalent_complexes`` if already set, otherwise computes
-        the equivalent complexes with
-        ``get_all_equiv_complexes`` (which folds to the
+        the equivalent complexes with ``get_all_equiv_complexes`` (which folds to the
         primitive cell, generates the orbit, and unfolds it back into
         ``self.structure``), and stores the orbit as ``self.equivalent_complexes``.
 
@@ -3412,51 +3411,70 @@ class DefectComplex(core.DefectComplex, Defect):
         )
         return len(self.equivalent_complexes)
 
-    # TODO we check for equivalent complexes but not equivalent structures?
-    # TODO switch to structurematcher once defect_structure is done?
     def __eq__(self, other) -> bool:
         """
         Determine whether two ``DefectComplex`` objects are equal.
 
-        Two complexes are equal if they have  identical host structures (not
-        just equivalent), and the two complexes are symmetry-equivalent, i.e.
-        related by a space group operation of the structure.
+        Two complexes are equal if they share equivalent structures, and
+        are related by a space group operation of their shared structure.
+
+        Uses the stricter (smaller) ``symprec`` of the two complexes, so
+        equality is symmetric.
         """
         if not isinstance(other, core.Defect):
             raise TypeError("Can only compare `Defect`s with `Defect`s!")
         if not isinstance(other, core.DefectComplex):
             return False  # unless we want to check if point defect = complex with one constituent?
-        if self is other or hash(self) == hash(other):
+        if self is other:
             return True
+        if self.name != other.name:
+            return False
+
+        dist_tol = min(self.symprec, other.symprec)
+
+        from doped.complexes import (
+            _get_complex_orbit_in_prim,
+            is_periodic_image,
+            unwrap_and_transform_to_prim,
+        )
+        from doped.utils.symmetry import get_primitive_structure
+
+        # check the two primitives
+        primitive = get_primitive_structure(self.structure, symprec=dist_tol)
+        prim_2 = get_primitive_structure(other.structure, symprec=dist_tol)
         if (
-            sorted(defect.name for defect in self.defects)
-            != sorted(defect.name for defect in other.defects)
-            or self.structure != other.structure
+            len(prim_2) != len(primitive)
+            or prim_2.composition.reduced_formula != primitive.composition.reduced_formula
         ):
             return False
 
-        dist_tol = self.symprec  # ?
+        # try to fold to same primitive
+        try:
+            self_prim_sites, other_prim_sites = [
+                unwrap_and_transform_to_prim(
+                    cplx.structure,
+                    [defect.site for defect in cplx.defects],
+                    primitive_structure=primitive,
+                    symprec=dist_tol,
+                )
+                for cplx in (self, other)
+            ]
+        except RuntimeError:  # structures don't match
+            return False
 
-        # check against equivalent complexes
-        from doped.complexes import is_periodic_image
-
-        if not self.equivalent_complexes:
-            self.get_multiplicity()  # computes and stores equivalent_complexes
-        other_sites = [defect.site for defect in other.defects]
-        return any(
-            is_periodic_image(other_sites, member, dist_tol=dist_tol)
-            for member in self.equivalent_complexes or []
-        )
+        # orbit sorting should be deterministic
+        self_rep = _get_complex_orbit_in_prim(self_prim_sites, primitive, symprec=dist_tol)[0][0]
+        other_rep = _get_complex_orbit_in_prim(other_prim_sites, primitive, symprec=dist_tol)[0][0]
+        return is_periodic_image(self_rep, other_rep, dist_tol=dist_tol)
 
     def __hash__(self):
         """
-        Hash the ``DefectComplex`` object, based on the sorted constituent
-        point defect names and the hashed host structure.
+        Hash the ``DefectComplex`` object, based on the constituent names.
 
-        In this implementation, equal hashes implies equal complexes, but equal
-        complexes may have unequal hashes.
+        Equal hashes implies equal complexes, but equal complexes may have
+        unequal hashes.
         """
-        return hash((tuple(sorted([hash(defect) for defect in self.defects])),))
+        return hash(self.name)
 
     def get_supercell_structure(self, *args, **kwargs) -> Structure:
         """
