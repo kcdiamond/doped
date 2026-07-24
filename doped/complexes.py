@@ -18,7 +18,7 @@ from pymatgen.analysis.molecule_matcher import BruteForceOrderMatcher
 from pymatgen.core.lattice import Lattice
 from pymatgen.core.operations import SymmOp
 from pymatgen.core.structure_matcher import get_linear_assignment_solution
-from pymatgen.util.coord import get_angle, pbc_shortest_vectors
+from pymatgen.util.coord import get_angle, lattice_points_in_supercell, pbc_shortest_vectors
 from scipy.cluster.hierarchy import fcluster, linkage
 from spglib import get_pointgroup
 from tqdm import tqdm
@@ -33,7 +33,6 @@ from doped.utils.parsing import (
 )
 from doped.utils.symmetry import (
     _frac_coords_sort_func,
-    get_distance_matrix,
     get_equiv_frac_coords_in_primitive,
     get_primitive_structure,
     get_sga_and_symprec,
@@ -87,12 +86,12 @@ def classify_vacancy_geometry(
             and bulk structures. If ``abs_tol`` is ``False`` (default), then
             this value multiplied by the shortest bond length in the bulk
             structure will be used as the distance threshold for matching,
-            otherwise the value is used directly (as a length in Å).
+            otherwise the value is used directly (as a length in Å).
             Default is 0.5 (i.e. half the shortest bond length in the bulk
             structure).
         abs_tol (bool):
             Whether to use ``site_tol`` as an absolute distance tolerance (in
-            Å) instead of a fractional tolerance (in terms of the shortest bond
+            Å) instead of a fractional tolerance (in terms of the shortest bond
             length in the structure). Default is ``False``.
         verbose (bool):
             Whether to print additional information about the classification
@@ -287,11 +286,11 @@ def get_equivalent_complex_defect_sites_in_primitive(
             are truly distinct), searching for equivalent sites (by
             inter-defect distances) and matching equivalent complex defect
             geometries (as ``Molecule``\s), as a multiplicative factor of
-            ``symprec``. Default is 1.0 (i.e. ``dist_tol = symprec``, in Å).
+            ``symprec``. Default is 1.0 (i.e. ``dist_tol = symprec``, in Å).
             Note that this should match the value used for determining the
             point defect multiplicities (e.g. with the
             ``Defect.get_multiplicity()`` methods) for appropriate comparisons
-            -- the same default of 0.01 Å is used in all relevant ``doped``
+            -- the same default of 0.01 Å is used in all relevant ``doped``
             functions. If ``fixed_symprec_and_dist_tol_factor`` is ``False``
             (default), this value will also be automatically adjusted if
             necessary (up to 10x, down to 0.1x)(after ``symprec`` adjustments)
@@ -612,11 +611,11 @@ def get_complex_defect_multiplicity(
             are truly distinct), searching for equivalent sites (by
             inter-defect distances) and matching equivalent complex defect
             geometries (as ``Molecule``\s), as a multiplicative factor of
-            ``symprec``. Default is 1.0 (i.e. ``dist_tol = symprec``, in Å).
+            ``symprec``. Default is 1.0 (i.e. ``dist_tol = symprec``, in Å).
             Note that this should match the value used for determining the
             point defect multiplicities (e.g. with the
             ``Defect.get_multiplicity()`` methods) for appropriate comparisons
-            -- the same default of 0.01 Å is used in all relevant ``doped``
+            -- the same default of 0.01 Å is used in all relevant ``doped``
             functions. If ``fixed_symprec_and_dist_tol_factor`` is ``False``
             (default), this value will also be automatically adjusted if
             necessary (up to 10x, down to 0.1x)(after ``symprec`` adjustments)
@@ -1504,25 +1503,23 @@ def unwrap_and_transform_to_prim(
     ]
 
 
-def get_complex_orbit_and_stabiliser(
+def _get_complex_orbit_in_prim(
     point_defects: list[PeriodicSite],
     primitive: Structure,
     quotient_ops: list[SymmOp] | None = None,
     symprec: float = 0.01,
     dist_tol_factor: float = 1.0,
-    give_input_stabiliser: bool = False,
-    give_point_group: bool = False,
-) -> tuple[list[list[PeriodicSite]], list[SymmOp]] | tuple[list[list[PeriodicSite]], list[SymmOp], str]:
+) -> tuple[list[list[PeriodicSite]], str]:
     """
-    Get the orbit and stabiliser of a defect complex, given a primitive
+    Get the orbit and point group of a defect complex, given a primitive
     structure. The order of sites within each complex is maintained from input
     to output.
 
     The orbit is deterministically sorted (independent of the input
     configuration and constituent ordering), such that ``orbit[0]`` is a consistent
     representative of the orbit, returned if any element of the orbit were input.
-    The returned stabiliser corresponds to this representative by default, or to the
-    input configuration if ``give_input_stabiliser=True``.
+    The point group (Schoenflies symbol) is that of the complex (i.e. of its
+    stabiliser, computed internally for the canonical representative).
 
     Args:
         point_defects (list[PeriodicSite]):
@@ -1540,25 +1537,23 @@ def get_complex_orbit_and_stabiliser(
         dist_tol_factor (float):
             Factor by which symprec is multiplied to give the distance
             tolerance for clustering equal complexes. (Default: 1.0)
-        give_input_stabiliser (bool):
-            Whether the returned stabiliser should correspond to the input
-            configuration (``True``) rather than the canonical representative
-            (``orbit[0]``; ``False``). (Default: False)
-        give_point_group (bool):
-            Whether to also return the Schoenflies point group symbol of the
-            complex (i.e. of the stabiliser). (Default: False)
 
     Returns:
-        tuple[list[list[PeriodicSite]], list[SymmOp]] | tuple[list[list[PeriodicSite]], list[SymmOp], str]:
-            The orbit and stabiliser of the complex in the crystal, per primitive
-            lattice cell. The orbit is deterministically sorted, and the
-            stabiliser corresponds to the canonical representative configuration
-            (``orbit[0]``) by default (see ``give_input_stabiliser``). If
-            ``give_point_group`` is ``True``, the Schoenflies point group symbol
-            of the complex is also returned as a third element. All elements of
-            the orbit are given in the unit primitive cell (i.e. with complex
-            centroids translated to lie within the unit cell).
+        tuple[list[list[PeriodicSite]], str]:
+            The orbit of the complex in the crystal (per primitive lattice
+            cell) and its Schoenflies point group symbol. The orbit is
+            deterministically sorted, with ``orbit[0]`` the canonical
+            representative, and all elements given in the unit primitive cell
+            (i.e. with complex centroids translated to lie within the unit
+            cell).
     """
+    # check that input structure is primitive
+    if len(get_primitive_structure(primitive, symprec=symprec)) != len(primitive):
+        raise ValueError(
+            "``_get_complex_orbit_in_prim`` requires a primitive host structure, but the provided "
+            "structure is not primitive. Try get_all_equiv_complexes, or adjust symmetry tolerances."
+        )
+
     # get space group if not provided
     if quotient_ops is None:
         bulk_sga, symprec = get_sga_and_symprec(primitive, symprec)
@@ -1606,13 +1601,11 @@ def get_complex_orbit_and_stabiliser(
     orbit, _sort_index = _sort_complex_orbit(orbit)
 
     # TODO just pick the right coset instead of redoing this
-    # get the stabiliser of either the input or the representative complex
-    if give_input_stabiliser:
-        target_fcs, target_transformed_fcs = point_fcs, transformed_fcs
-    else:
-        target_fcs = np.asarray([site.frac_coords for site in orbit[0]])
-        target_transformed_fcs = np.einsum("oij,nj->oni", rotations, target_fcs) + translations[:, None, :]
-        target_transformed_fcs -= np.floor(np.mean(target_transformed_fcs, axis=1, keepdims=True))
+    # get the stabiliser of the canonical representative complex (orbit[0]), used for the point group
+    # and the orbit-stabiliser sanity check below:
+    target_fcs = np.asarray([site.frac_coords for site in orbit[0]])
+    target_transformed_fcs = np.einsum("oij,nj->oni", rotations, target_fcs) + translations[:, None, :]
+    target_transformed_fcs -= np.floor(np.mean(target_transformed_fcs, axis=1, keepdims=True))
     stabiliser = [
         op
         for op, op_fcs in zip(quotient_ops, target_transformed_fcs, strict=True)
@@ -1628,14 +1621,91 @@ def get_complex_orbit_and_stabiliser(
         )
 
     # TODO align with new local_point_symmetry methods - eg schoenflies from cartesian ops etc
-    if give_point_group:
-        pg_ops = [np.rint(op.rotation_matrix).astype(int) for op in stabiliser]
-        if (pointgroup := get_pointgroup(pg_ops)) is None:
-            raise RuntimeError("Could not determine the point group of the defect complex stabiliser.")
-        hermann_symbol, _number, _transform = pointgroup
-        return orbit, stabiliser, schoenflies_from_hermann(hermann_symbol.strip())
+    pg_ops = [np.rint(op.rotation_matrix).astype(int) for op in stabiliser]
+    if (pointgroup := get_pointgroup(pg_ops)) is None:
+        raise RuntimeError("Could not determine the point group of the defect complex stabiliser.")
+    hermann_symbol, _number, _transform = pointgroup
+    return orbit, schoenflies_from_hermann(hermann_symbol.strip())
 
-    return orbit, stabiliser
+
+def get_all_equiv_complexes(
+    sites: list[PeriodicSite],
+    bulk_supercell: Structure,
+    symprec: float = 0.01,
+    dist_tol_factor: float = 1.0,
+    return_point_group: bool = False,
+) -> list[list[PeriodicSite]] | tuple[list[list[PeriodicSite]], str]:
+    """
+    Get all symmetry-equivalent defect complexes in a cell (supercell or
+    primitive).
+
+    The cell is folded to a primitive cell, the orbit is generated by the
+    space group operations of the structure and clustering, and the resulting
+    configurations are transformed back to the original cell.
+
+    The order of sites within each complex is unchanged.
+
+    Args:
+        sites (list[|PeriodicSite|]):
+            Constituent (defect) sites of the complex, defined in the
+            ``bulk_supercell`` frame.
+        bulk_supercell (|Structure|):
+            Bulk (super)cell host structure, in which ``sites`` are defined.
+        symprec (float):
+            Symmetry precision for the primitive-cell determination and space
+            group operations. (Default: 0.01)
+        dist_tol_factor (float):
+            Factor by which ``symprec`` is multiplied to give the distance
+            tolerance for clustering equal complexes. (Default: 1.0)
+        return_point_group (bool):
+            If ``True``, also return the Schoenflies point group symbol of the
+            complex (as determined in the primitive cell). (Default: False)
+
+    Returns:
+        list[list[|PeriodicSite|]] | tuple[list[list[|PeriodicSite|]], str]:
+            All symmetry-equivalent complexes in ``bulk_supercell``, each as a
+            list of |PeriodicSite| objects (same species and ordering as
+            ``sites``). If ``return_point_group`` is ``True``, also returns the
+            Schoenflies point group symbol of the complex as a second element.
+    """
+    from doped.utils.symmetry import _get_orientation_preserving_primitive
+
+    prim_and_matrix = _get_orientation_preserving_primitive(bulk_supercell, symprec=symprec)
+    if prim_and_matrix is None:  # already primitive (get_complex_orbit should catch spglib fail)
+        orbit, point_group = _get_complex_orbit_in_prim(
+            sites, bulk_supercell, symprec=symprec, dist_tol_factor=dist_tol_factor
+        )
+        return (orbit, point_group) if return_point_group else orbit
+    primitive, M = prim_and_matrix
+
+    # fold the complex into the primitive cell and get its orbit
+    prim_sites = unwrap_and_transform_to_prim(
+        bulk_supercell, sites, primitive_structure=primitive, symprec=symprec
+    )
+    orbit, point_group = _get_complex_orbit_in_prim(
+        prim_sites, primitive, symprec=symprec, dist_tol_factor=dist_tol_factor
+    )
+
+    # transform back and add all images
+    inv_M = np.linalg.inv(M)
+    cosets = lattice_points_in_supercell(M)
+    all_complexes = []
+    for complex_sites in orbit:
+        sc_fcs = np.array([site.frac_coords for site in complex_sites]) @ inv_M
+        for coset in cosets:
+            shifted_fcs = sc_fcs + coset
+            shifted_fcs -= np.floor(np.mean(shifted_fcs, axis=0))  # centroid lands in unit supercell
+            all_complexes.append(
+                [
+                    PeriodicSite(site.species, fc, bulk_supercell.lattice, coords_are_cartesian=False)
+                    for site, fc in zip(complex_sites, shifted_fcs, strict=True)
+                ]
+            )
+
+    # deterministic ordering
+    all_complexes, _sort_index = _sort_complex_orbit(all_complexes)
+
+    return (all_complexes, point_group) if return_point_group else all_complexes
 
 
 def _sort_complex_orbit(
@@ -1644,9 +1714,9 @@ def _sort_complex_orbit(
 ) -> tuple[list[list[PeriodicSite]], list[int]]:
     r"""
     Deterministically sort the members of a defect complex orbit (used within
-    ``get_complex_orbit_and_stabiliser``). The order of the point defects
-    within each complex on input is maintained, and the complex sort order is
-    independent of the order of these point defects.
+    ``_get_complex_orbit_in_prim``). The order of the point defects within each
+    complex on input is maintained, and the complex sort order is independent
+    of the order of these point defects.
 
     The sorting order is based on the point defects, but is not the same order as
     _sort_defects, and is intended only to give a deterministic output order of

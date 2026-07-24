@@ -27,7 +27,7 @@ from pymatgen.io.vasp.outputs import Procar, Vasprun
 from pymatgen.util.typing import PathLike
 from tqdm import tqdm
 
-from doped.complexes import get_complex_orbit_and_stabiliser, unwrap_and_transform_to_prim
+from doped.complexes import _get_complex_orbit_in_prim, unwrap_and_transform_to_prim
 from doped.core import Defect, DefectComplex, DefectEntry, guess_and_set_oxi_states_with_timeout
 from doped.generation import (
     _defect_sort_key,
@@ -687,12 +687,11 @@ def defect_complex_from_structures(
     # GET EQUIVALENT COMPLEXES
 
     # get equivalent complexes
-    orbit_and_stabiliser = get_complex_orbit_and_stabiliser(
+    orbit, point_group = _get_complex_orbit_in_prim(
         rel_obj_sites,
         primitive_structure,
         **{k: v for k, v in kwargs.items() if k in ["symprec", "dist_tol_factor"]},
     )
-    orbit, stabiliser = orbit_and_stabiliser[0], orbit_and_stabiliser[1]
     rel_obj_sites = orbit[0]
     # note order of point defects within each orbit member is unchanged
 
@@ -817,7 +816,7 @@ def defect_complex_from_structures(
 
     # RETURN COMPLEX
 
-    complex_defect = DefectComplex(point_defects, equivalent_complexes=orbit, stabiliser=stabiliser)
+    complex_defect = DefectComplex(point_defects, equivalent_complexes=orbit, point_group=point_group)
 
     if not return_all_info:
         return complex_defect

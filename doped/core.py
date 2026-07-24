@@ -15,7 +15,6 @@ from monty.serialization import dumpfn, loadfn
 from pymatgen.analysis.defects import core, thermo, utils
 from pymatgen.core.bond_valence import BVAnalyzer
 from pymatgen.core.entries import ComputedEntry, ComputedStructureEntry
-from pymatgen.core.operations import SymmOp
 from pymatgen.core.periodic_table import DummySpecies
 from pymatgen.core.structure_matcher import SpeciesComparator
 from pymatgen.io.vasp.outputs import Locpot, Outcar, Procar, Vasprun
@@ -3188,7 +3187,6 @@ class Interstitial(Defect, core.Interstitial):
         return f"{self.name} interstitial defect at site [{frac_coords_string}] in structure"
 
 
-# TODO check if stabiliser still needed
 class DefectComplex(core.DefectComplex, Defect):
     """
     ``doped`` ``DefectComplex`` object, defining a complex of point defects
@@ -3208,7 +3206,7 @@ class DefectComplex(core.DefectComplex, Defect):
         oxi_state: float | str | None = None,
         multiplicity: int | None = None,
         equivalent_complexes: list[list[PeriodicSite]] | None = None,
-        stabiliser: list[SymmOp] | None = None,
+        point_group: str | None = None,
         map_to_unit_cell: bool = True,
         **doped_kwargs,
     ):
@@ -3237,12 +3235,10 @@ class DefectComplex(core.DefectComplex, Defect):
                 complex in the host structure, as lists of constituent sites
                 (with constituent ordering matching ``defects``, and each
                 configuration rigidly translated such that its centroid lies
-                within the unit cell); e.g. as output by
-                ``doped.complexes.get_complex_orbit_and_stabiliser``.
-            stabiliser (list[SymmOp]):
-                The stabiliser of the complex, a subgroup of the space group of
-                the host structure.
-                NOTE temporary? and of primitive always
+                within the unit cell).
+            point_group (str):
+                The Schoenflies point group symbol of the defect complex (i.e.
+                of its stabiliser). Optional; ``None`` if not determined.
             map_to_unit_cell (bool):
                 Whether to transform the defect complex site, as well as
                 the constituent point defect sites, to the unit cell, by an integer
@@ -3267,7 +3263,7 @@ class DefectComplex(core.DefectComplex, Defect):
         # TODO sort on init?
         self.defects = defects
         self.equivalent_complexes = equivalent_complexes
-        self.stabiliser = stabiliser
+        self.point_group = point_group
         self.structure = defects[0].structure
         centroid_frac_coords = np.mean([defect.site.frac_coords for defect in defects], axis=0)
 
@@ -3347,10 +3343,6 @@ class DefectComplex(core.DefectComplex, Defect):
         """
         return "+".join(defect.name for defect in self.defects)
 
-    # TODO note currently equivalent_complexes are stored in primitive - should
-    # we transform back before storing? store all equivalent in supercell? could be a lot?
-    # transform symmops to supercell?
-    # copy to all equivalent sites and wrap?
     def get_multiplicity(
         self,
         symprec: float | None = None,
@@ -3361,17 +3353,14 @@ class DefectComplex(core.DefectComplex, Defect):
         """
         Calculate the multiplicity of the defect complex.
 
-        If ``self.structure`` is a supercell (i.e. not the primitive host
-        cell), the complex sites are first unwrapped and folded into the
-        primitive cell (via ``complexes.unwrap_and_transform_to_prim``)
-        before determining the orbit.
+        The multiplicity is the number of symmetry-equivalent configurations of
+        the complex in ``self.structure``.
 
-        The multiplicity is the size of the orbit of the complex
-        configuration under the host structure symmetry operations:
-        ``self.equivalent_complexes`` if set, otherwise
-        computed by ``doped`` (``get_complex_orbit_and_stabiliser``),
-        in which case the computed orbit (as well as the stabiliser)
-        is stored for the DefectComplex object.
+        Uses ``self.equivalent_complexes`` if already set, otherwise computes
+        the equivalent complexes with
+        ``get_all_equiv_complexes`` (which folds to the
+        primitive cell, generates the orbit, and unfolds it back into
+        ``self.structure``), and stores the orbit as ``self.equivalent_complexes``.
 
         Args:
             symprec (float):
@@ -3384,64 +3373,44 @@ class DefectComplex(core.DefectComplex, Defect):
                 configurations, as a multiplicative factor of ``symprec``.
                 Default is 1.0.
             primitive_structure (|Structure| | None):
-                Primitive bulk structure, else it will be derived from
-                self.structure.
+                (Deprecated, to be removed in v4.1.) Unused; retained for
+                backwards compatibility. Primitive cell folding is now handled
+                internally in ``get_all_equiv_complexes``.
             **kwargs:
-                Additional keyword arguments. |StructureMatcher| keyword
-                arguments (``ltol``, ``stol``, ``angle_tol``, ``min_stol``,
-                ``max_stol``, ``stol_factor``, ``comparator``) are routed to
-                ``unwrap_and_transform_to_prim`` for the supercell ->
-                primitive transformation; any others (e.g. ``quotient_ops``)
-                are passed to ``get_complex_orbit_and_stabiliser``.
+                Unused; retained for signature compatibility with
+                ``Defect.get_multiplicity``.
 
         Returns:
-            int: The multiplicity of the complex (orbit size in the
-            primitive host cell).
+            int: The multiplicity of the complex (number of symmetry-equivalent
+            configurations in ``self.structure``).
         """
+        if primitive_structure is not None:
+            warnings.warn(  # TODO: Remove ``primitive_structure`` in v4.1
+                "The ``primitive_structure`` parameter of ``DefectComplex.get_multiplicity`` is "
+                "deprecated and will be removed in v4.1. Primitive cell folding is now handled "
+                "internally in ``get_all_equiv_complexes``.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
         # TODO we actually don't do this for doped Defect
         if self.equivalent_complexes:
             return len(self.equivalent_complexes)
 
-        from doped.complexes import get_complex_orbit_and_stabiliser, unwrap_and_transform_to_prim
-        from doped.utils.symmetry import get_primitive_structure
+        from doped.complexes import get_all_equiv_complexes
 
         assert isinstance(self.structure, Structure)
-        primitive_structure = primitive_structure or get_primitive_structure(
-            self.structure,
-            symprec=symprec or self.symprec,
-        )
-
-        # StructureMatcher kwargs to the supercell to primitive transformation:
-        sm_kwargs = {
-            k: kwargs.pop(k)
-            for k in ("ltol", "stol", "angle_tol", "min_stol", "max_stol", "stol_factor", "comparator")
-            if k in kwargs
-        }
-
-        # fold complex sites into the primitive cell if self.structure is a supercell:
-        defect_sites = [defect.site for defect in self.defects]
-        if primitive_structure != self.structure:
-            defect_sites = unwrap_and_transform_to_prim(
-                bulk_supercell=self.structure,
-                sites=defect_sites,
-                primitive_structure=primitive_structure,
+        self.equivalent_complexes, self.point_group = cast(
+            "tuple[list[list[PeriodicSite]], str]",
+            get_all_equiv_complexes(
+                [defect.site for defect in self.defects],
+                self.structure,
                 symprec=symprec or self.symprec,
-                **sm_kwargs,
-            )
-
-        orb_stab = get_complex_orbit_and_stabiliser(
-            defect_sites,
-            primitive_structure,
-            symprec=symprec or self.symprec,
-            dist_tol_factor=dist_tol_factor,
-            give_input_stabiliser=True,  # the stabiliser of the actual stored complex
-            **kwargs,
+                dist_tol_factor=dist_tol_factor,
+                return_point_group=True,
+            ),
         )
-        orbit, stabiliser = orb_stab[0], orb_stab[1]
-        self.equivalent_complexes = orbit
-        if self.stabiliser is None:
-            self.stabiliser = stabiliser
-        return len(orbit)
+        return len(self.equivalent_complexes)
 
     # TODO we check for equivalent complexes but not equivalent structures?
     # TODO switch to structurematcher once defect_structure is done?
