@@ -3434,8 +3434,8 @@ class DefectComplex(core.DefectComplex, Defect):
 
         from doped.complexes import (
             _get_complex_orbit_in_prim,
+            _unwrap_and_transform_to_prim,
             is_periodic_image,
-            unwrap_and_transform_to_prim,
         )
         from doped.utils.symmetry import get_primitive_structure
 
@@ -3451,7 +3451,7 @@ class DefectComplex(core.DefectComplex, Defect):
         # try to fold to same primitive
         try:
             self_prim_sites, other_prim_sites = [
-                unwrap_and_transform_to_prim(
+                _unwrap_and_transform_to_prim(
                     cplx.structure,
                     [defect.site for defect in cplx.defects],
                     primitive_structure=primitive,

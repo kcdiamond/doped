@@ -1097,6 +1097,9 @@ def _guess_initial_defect_structure(
     if defect_type != "interstitial":
         return guessed_initial_defect_structure, defect_site_in_bulk
 
+    # (if defect_site_index was out of range interstitial will have been added at end)
+    defect_site_index = min(cast("int", defect_site_index), len(guessed_initial_defect_structure) - 1)
+
     # get closest candidate interstitial site in bulk supercell (based on default interstitial gen
     # settings) to the relaxed interstitial site, as this is likely the _initial_ interstitial site
     int_site = guessed_initial_defect_structure.pop(defect_site_index)

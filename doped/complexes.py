@@ -6,7 +6,7 @@ import contextlib
 import math
 import warnings
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from copy import deepcopy
 from functools import lru_cache
 from itertools import combinations, product
@@ -1406,7 +1406,125 @@ def _cluster_complex_frac_coords(
     )
 
 
-def unwrap_and_transform_to_prim(
+def _get_unwrapped_complex_fc(
+    bulk_supercell: Structure,
+    sites: list[PeriodicSite],
+) -> list[np.ndarray]:
+    """
+    Unwrap a set of (defect complex) sites in a bulk supercell, returning their
+    (un-wrapped) fractional coordinates in the supercell frame.
+
+    The sites are unwrapped to the unique complex or (with warning) to the
+    complex with the smallest span. The ordering of the input sites is
+    unchanged.
+
+    Args:
+        bulk_supercell (|Structure|):
+            Bulk supercell host structure, in which ``sites`` are defined.
+        sites (list[|PeriodicSite|]):
+            Constituent (defect) sites to unwrap, defined in the
+            ``bulk_supercell`` frame.
+
+    Returns:
+        list[np.ndarray]:
+            The unwrapped fractional coordinates of ``sites`` (same
+            ordering), in the ``bulk_supercell`` frame.
+    """
+    from doped.utils.supercells import get_min_image_distance
+
+    # try first unwrapping
+    max_complex_span = get_min_image_distance(bulk_supercell) / 2
+    unwrapped_fc = [site.frac_coords + sites[0].distance_and_image(site)[1] for site in sites]
+    cart_coords = bulk_supercell.lattice.get_cartesian_coords(unwrapped_fc)
+    complex_span = np.linalg.norm(cart_coords[:, None] - cart_coords, axis=-1).max()
+
+    # if unwrapping is not unique, get best - anchor with smallest max distance to all other points
+    if complex_span >= max_complex_span:
+        for anchor_site in sites[1:]:
+            candidate_fc = [site.frac_coords + anchor_site.distance_and_image(site)[1] for site in sites]
+            cart_coords = bulk_supercell.lattice.get_cartesian_coords(candidate_fc)
+            candidate_span = np.linalg.norm(cart_coords[:, None] - cart_coords, axis=-1).max()
+            if candidate_span < complex_span:
+                unwrapped_fc, complex_span = candidate_fc, candidate_span
+        warnings.warn(
+            f"The defect complex spans {complex_span:.2f} Å, which is greater than half the min "
+            f"image distance of the supercell ({max_complex_span:.2f} Å). The unwrapped complex "
+            f"may be ambiguous."
+        )
+
+    return unwrapped_fc
+
+
+def _transform_complex_fc_to_prim(
+    bulk_supercell: Structure,
+    unwrapped_fc: Sequence[np.ndarray],
+    primitive_structure: Structure,
+    symprec: float = 0.01,
+    **sm_kwargs,
+) -> list[np.ndarray]:
+    """
+    Transform unwrapped (defect complex) fractional coordinates from the bulk
+    supercell frame into the primitive host frame.
+
+    The coordinates are translated such that the complex centroid lands in the
+    unit primitive cell; they are `not` individually mapped back to the unit
+    cell, so the relative geometry of the complex is preserved. The ordering of
+    the input coordinates is unchanged.
+
+    Args:
+        bulk_supercell (|Structure|):
+            Bulk supercell host structure, in which ``unwrapped_fc`` are
+            defined.
+        unwrapped_fc (Sequence[np.ndarray]):
+            Unwrapped fractional coordinates of the constituent (defect) sites,
+            in the ``bulk_supercell`` frame; see
+            ``_get_unwrapped_complex_fc``.
+        primitive_structure (|Structure|):
+            Primitive host structure to transform the coordinates into.
+        symprec (float):
+            Symmetry precision for the supercell-to-primitive fold map.
+            (Default: 0.01)
+        **sm_kwargs:
+            Additional keyword arguments for the supercell-to-primitive
+            transformation (``get_transformation_from_s2_to_s1``, i.e.
+            |StructureMatcher| keyword arguments such as ``ltol``, ``stol``,
+            ``angle_tol``, ``comparator``).
+
+    Returns:
+        list[np.ndarray]:
+            The fractional coordinates in the primitive host frame (same
+            ordering as ``unwrapped_fc``).
+    """
+    from doped.utils.configurations import get_transformation_from_s2_to_s1
+    from doped.utils.symmetry import _get_supercell_to_prim_fold_map
+
+    # try prim fold map, else fallback to StructureMatcher?
+    fold_map = _get_supercell_to_prim_fold_map(bulk_supercell, primitive_structure, symprec=symprec)
+    if fold_map is not None:
+        M, translation = fold_map
+        sc_matrix = np.asarray(M)
+        offset = np.asarray(translation)
+    else:
+        sm_kwargs.setdefault("attempt_supercell", True)
+        sm_kwargs.setdefault("scale", False)
+        transformation = get_transformation_from_s2_to_s1(bulk_supercell, primitive_structure, **sm_kwargs)
+        if transformation is None:  # no match to primitive
+            raise RuntimeError(
+                "Could not map the input structure onto the given primitive cell (no "
+                "``StructureMatcher`` match) - they likely do not correspond to the same structure. "
+                "Try passing without ``primitive_structure`` argument?"
+            )
+        sc_matrix, trans_vector, _mapping = transformation
+        sc_matrix = np.asarray(sc_matrix)
+        offset = -np.asarray(trans_vector) @ sc_matrix
+
+    # shift offset such that the centroid lands in the unit primitive cell:
+    offset = offset - np.floor(np.mean(unwrapped_fc, axis=0) @ sc_matrix + offset)
+
+    return [sc_fc @ sc_matrix + offset for sc_fc in unwrapped_fc]
+
+
+def _unwrap_and_transform_to_prim(
     bulk_supercell: Structure,
     sites: list[PeriodicSite],
     primitive_structure: Structure | None = None,
@@ -1446,63 +1564,17 @@ def unwrap_and_transform_to_prim(
             The unwrapped sites recreated in the primitive host frame (same
             species and ordering as ``sites``).
     """
-    from doped.utils.configurations import get_transformation_from_s2_to_s1
-    from doped.utils.supercells import get_min_image_distance
-    from doped.utils.symmetry import _get_supercell_to_prim_fold_map
-
     if primitive_structure is None:
         primitive_structure = get_primitive_structure(bulk_supercell, symprec=symprec)
 
-    # UNWRAPPING
-
-    # try first unwrapping
-    max_complex_span = get_min_image_distance(bulk_supercell) / 2
-    unwrapped_fc = [site.frac_coords + sites[0].distance_and_image(site)[1] for site in sites]
-    cart_coords = bulk_supercell.lattice.get_cartesian_coords(unwrapped_fc)
-    complex_span = np.linalg.norm(cart_coords[:, None] - cart_coords, axis=-1).max()
-
-    # if unwrapping is not unique, get best - anchor with smallest max distance to all other points
-    if complex_span >= max_complex_span:
-        for anchor_site in sites[1:]:
-            candidate_fc = [site.frac_coords + anchor_site.distance_and_image(site)[1] for site in sites]
-            cart_coords = bulk_supercell.lattice.get_cartesian_coords(candidate_fc)
-            candidate_span = np.linalg.norm(cart_coords[:, None] - cart_coords, axis=-1).max()
-            if candidate_span < complex_span:
-                unwrapped_fc, complex_span = candidate_fc, candidate_span
-        warnings.warn(
-            f"The defect complex spans {complex_span:.2f} Å, which is greater than half the min "
-            f"image distance of the supercell ({max_complex_span:.2f} Å). The unwrapped complex "
-            f"may be ambiguous."
-        )
-
-    # TRANSFORM SUPERCELL TO PRIMITIVE CELL
-
-    # try prim fold map, else fallback to StructureMatcher?
-    fold_map = _get_supercell_to_prim_fold_map(bulk_supercell, primitive_structure, symprec=symprec)
-    if fold_map is not None:
-        M, translation = fold_map
-        sc_matrix = np.asarray(M)
-        offset = np.asarray(translation)
-    else:
-        sm_kwargs.setdefault("attempt_supercell", True)
-        sm_kwargs.setdefault("scale", False)
-        transformation = get_transformation_from_s2_to_s1(bulk_supercell, primitive_structure, **sm_kwargs)
-        if transformation is None:  # no match to primitive
-            raise RuntimeError(
-                "Could not map the input structure onto the given primitive cell (no "
-                "``StructureMatcher`` match) - they likely do not correspond to the same structure. "
-                "Try passing without ``primitive_structure`` argument?"
-            )
-        sc_matrix, trans_vector, _mapping = transformation
-        sc_matrix = np.asarray(sc_matrix)
-        offset = -np.asarray(trans_vector) @ sc_matrix
-
-    # shift offset such that the centroid lands in the unit primitive cell:
-    offset = offset - np.floor(np.mean(unwrapped_fc, axis=0) @ sc_matrix + offset)
-
-    # recreate sites in primitive
-    rel_obj_fcs = [sc_fc @ sc_matrix + offset for sc_fc in unwrapped_fc]
-    return [
+    rel_obj_fcs = _transform_complex_fc_to_prim(
+        bulk_supercell,
+        _get_unwrapped_complex_fc(bulk_supercell, sites),
+        primitive_structure,
+        symprec=symprec,
+        **sm_kwargs,
+    )
+    return [  # recreate sites in primitive
         PeriodicSite(site.species, rel_fc, primitive_structure.lattice, coords_are_cartesian=False)
         for site, rel_fc in zip(sites, rel_obj_fcs, strict=True)
     ]
@@ -1554,6 +1626,7 @@ def _get_complex_orbit_in_prim(
     """
     # check that input structure is primitive
     if len(get_primitive_structure(primitive, symprec=symprec)) != len(primitive):
+        # TODO better way to deal with this?
         raise ValueError(
             "``_get_complex_orbit_in_prim`` requires a primitive host structure, but the provided "
             "structure is not primitive. Try get_all_equiv_complexes, or adjust symmetry tolerances."
@@ -1684,7 +1757,7 @@ def get_all_equiv_complexes(
     primitive, M = prim_and_matrix
 
     # fold the complex into the primitive cell and get its orbit
-    prim_sites = unwrap_and_transform_to_prim(
+    prim_sites = _unwrap_and_transform_to_prim(
         bulk_supercell, sites, primitive_structure=primitive, symprec=symprec
     )
     orbit, point_group = _get_complex_orbit_in_prim(

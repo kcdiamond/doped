@@ -13,13 +13,14 @@ import warnings
 from copy import deepcopy
 from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 from monty.json import MontyDecoder
 from monty.serialization import dumpfn
 from mp_api.client import MPRester
 from pymatgen.core import Element
+from pymatgen.core.periodic_table import DummySpecies
 from pymatgen.core.sites import PeriodicSite
 from pymatgen.core.structure import Composition, Structure
 from pymatgen.electronic_structure.dos import FermiDos
@@ -27,7 +28,11 @@ from pymatgen.io.vasp.outputs import Procar, Vasprun
 from pymatgen.util.typing import PathLike
 from tqdm import tqdm
 
-from doped.complexes import _get_complex_orbit_in_prim, unwrap_and_transform_to_prim
+from doped.complexes import (
+    _get_complex_orbit_in_prim,
+    _get_unwrapped_complex_fc,
+    _transform_complex_fc_to_prim,
+)
 from doped.core import Defect, DefectComplex, DefectEntry, guess_and_set_oxi_states_with_timeout
 from doped.generation import (
     _defect_sort_key,
@@ -333,6 +338,7 @@ def defect_sites_from_structures(
         | list[tuple[PeriodicSite, str, PeriodicSite, int | None, int | None, Structure, Structure]],
         Structure,
         Structure,
+        list[PeriodicSite],
     ]
 ):
     """
@@ -404,6 +410,11 @@ def defect_sites_from_structures(
     complex structure (with interstitials at their `relaxed` positions), and
     ``guessed_initial_complex_structure`` is the corresponding structure with
     interstitials moved to their guessed initial (unrelaxed) sites.
+    ``guessed_interstitial_sites_in_bulk`` is the corresponding guessed initial
+    site in the bulk supercell for each interstitial (ordered as they appear in
+    ``all_point_defects_info``), determined for the complex as a whole
+    unlike the per-constituent ``defect_site_in_bulk`` values, which follow the
+    isolated point defect convention (see ``_guess_initial_complex_structure``).
     """
     if _parameter_order_warn:
         _warn_parameter_order("defect_site_from_structures")  # TODO: Remove in doped v4.1
@@ -495,8 +506,7 @@ def defect_sites_from_structures(
         unrelaxed_complex_structure = _create_unrelaxed_complex_structure(
             defect_supercell, bulk_supercell, point_defects
         )
-        # TODO return sites in bulk?
-        guessed_initial_complex_structure, _guessed_int_sites_in_bulk = _guess_initial_complex_structure(
+        guessed_initial_complex_structure, guessed_int_sites_in_bulk = _guess_initial_complex_structure(
             unrelaxed_complex_structure,
             bulk_supercell,
             int_defect_sites,
@@ -506,6 +516,7 @@ def defect_sites_from_structures(
             all_point_defects_info if return_point_info else defect_sites,
             unrelaxed_complex_structure,
             guessed_initial_complex_structure,
+            guessed_int_sites_in_bulk,
         )
     return all_point_defects_info
 
@@ -521,6 +532,12 @@ def defect_complex_from_structures(
     DefectComplex
     | tuple[
         DefectComplex,
+        PeriodicSite,
+        PeriodicSite,
+        list[int | None],
+        list[int | None],
+        Structure,
+        Structure,
         list[tuple[Defect, PeriodicSite, PeriodicSite, int | None, int | None, Structure, Structure]],
     ]
 ):
@@ -535,14 +552,16 @@ def defect_complex_from_structures(
 
     If ``return_all_info`` is set to true, then also returns:
 
-    - `relaxed` defect site in the defect supercell (or the vacated bulk
-      site for vacancies)
-    - the bulk site (in the bulk supercell) corresponding to the defect site
-    - defect site index in the defect supercell
-    - bulk site index (index of defect site in bulk supercell)
-    - guessed initial defect structure (before relaxation)
-    - 'unrelaxed defect structure' (also before relaxation, but with
-      interstitials at their `relaxed` positions).
+    - `relaxed` defect complex site (centroid) in the defect supercell
+    - the bulk complex site (centroid, in the bulk supercell) corresponding
+      to the defect complex site
+    - defect site indices in the defect supercell
+    - bulk site indices (indices of defect sites in bulk supercell)
+    - guessed initial defect complex structure (before relaxation)
+    - 'unrelaxed defect complex structure' (also before relaxation, but with
+      interstitials at their `relaxed` positions)
+    - the corresponding per-constituent information (as for
+      ``defect_from_structures``, for each constituent point defect).
 
     See the ``Returns`` docstring section for full descriptions.
 
@@ -575,66 +594,116 @@ def defect_complex_from_structures(
             not required.
 
     Returns:
-        defect (|Defect|):
-            ``doped`` |Defect| object, defined in the primitive structure,
-            where ``Defect.site`` is the bulk site for vacancies and
-            substitutions, or the `relaxed` site (placed in the primitive host
-            structure) for interstitials. This site is used for site
-            multiplicity and bulk site point symmetry analyses.
+        defect (|DefectComplex|):
+            ``doped`` |DefectComplex| object, defined in the primitive
+            structure.
 
         If ``return_all_info`` is True, then also returns:
 
         defect_site (|PeriodicSite|):
-            ``pymatgen`` |PeriodicSite| object of the defect site in the
-            `defect` supercell. For substitutions and interstitials, this is
-            the `relaxed` site of the substituting/interstitial atom,
-            while for vacancies (which have no corresponding atom in the
-            defect supercell) it is the vacated site from the (unrelaxed)
-            `bulk` supercell.
+            ``pymatgen`` |PeriodicSite| object of the defect complex site in
+            the `defect` supercell; the (dummy species) centroid of the
+            `unwrapped` constituent defect sites, where each constituent site
+            follows the same convention as for point defects (the `relaxed`
+            site of the substituting/interstitial atom, or the vacated
+            (unrelaxed) `bulk` supercell site for vacancies).
         defect_site_in_bulk (|PeriodicSite|):
-            ``pymatgen`` |PeriodicSite| of the bulk site (in the bulk
-            supercell) corresponding to the defect site. For vacancies, this is
-            the vacated bulk site; for substitutions, it is the substituted
-            bulk site but with the `substituting` species; for interstitials,
-            it is the guessed initial (unrelaxed) interstitial site `if` this
-            is within 1 Å of the `relaxed` site, otherwise the `relaxed` site.
-        defect_site_index (int):
-            Index of defect site in defect supercell (None for vacancies)
-        bulk_site_index (int):
-            Index of defect site in bulk supercell (None for interstitials)
-        guessed_initial_defect_structure (|Structure|):
+            ``pymatgen`` |PeriodicSite| of the defect complex site in the
+            `bulk` supercell; the (dummy species) centroid of the `unwrapped`
+            constituent bulk sites (following the same per-constituent
+            convention as for point defects; see ``defect_from_structures``).
+        defect_site_indices (list[int | None]):
+            Indices of the constituent defect sites in the defect supercell
+            (``None`` entries for vacancies), matching the ordering of
+            ``defect.defects``.
+        bulk_site_indices (list[int | None]):
+            Indices of the constituent defect sites in the bulk supercell
+            (``None`` entries for interstitials), matching the ordering of
+            ``defect.defects``.
+        guessed_initial_complex_structure (|Structure|):
             ``pymatgen`` |Structure| object of the guessed initial defect
+            complex structure.
+        unrelaxed_complex_structure (|Structure|):
+            ``pymatgen`` |Structure| object of the unrelaxed defect complex
             structure.
-        unrelaxed_defect_structure (|Structure|):
-            ``pymatgen`` |Structure| object of the unrelaxed defect
-            structure.
+        all_info (list[tuple]):
+            Per-constituent information, as a list of
+            ``(defect, defect_site, defect_site_in_bulk, defect_site_index,
+            bulk_site_index, guessed_initial_defect_structure,
+            unrelaxed_defect_structure)`` tuples -- matching the
+            ``return_all_info`` output of ``defect_from_structures`` for each
+            constituent point defect, and ordered as ``defect.defects``.
     """
     if _parameter_order_warn:
-        _warn_parameter_order("defect_from_structures")  # TODO: Remove in doped v4.1
+        _warn_parameter_order("defect_complex_from_structures")  # TODO: Remove in doped v4.1
 
-    defect_sites_info = defect_sites_from_structures(
-        defect_supercell, bulk_supercell, return_point_info=True, _parameter_order_warn=False
+    # TODO clean up flags etc.
+    (
+        defect_sites_info,
+        unrelaxed_complex_structure,
+        guessed_initial_complex_structure,
+        guessed_int_sites_in_bulk,
+    ) = cast(  # typing fix - clean up if flags change
+        "tuple[list[tuple[PeriodicSite, str, PeriodicSite, int | None, int | None, Structure, "
+        "Structure]], Structure, Structure, list[PeriodicSite]]",
+        defect_sites_from_structures(
+            defect_supercell,
+            bulk_supercell,
+            return_point_info=True,
+            return_complex_info=True,
+            _parameter_order_warn=False,
+        ),
     )
     (
         defect_sites,
         defect_types,
-        defect_sites_in_bulk,
+        point_sites_in_bulk,  # per-constituent (isolated point defect convention) sites in bulk
         _defect_site_indices,
         _bulk_site_indices,
         _guessed_initial_defect_structures,
         _unrelaxed_defect_structures,
     ) = zip(*defect_sites_info, strict=True)
 
-    # TODO: using bulk_site_centroid to check atom mapping? appropriate?
-    if not skip_atom_mapping_check:
-        anchor_site = defect_sites_in_bulk[0]
-        bulk_site_centroid = np.mean(
+    # use complex structures for defect sites in bulk - in case generation of
+    # guessed structure differs from individually generated
+    defect_sites_in_bulk = list(point_sites_in_bulk)
+    int_idxs = [i for i, defect_type in enumerate(defect_types) if defect_type == "interstitial"]
+    for i, site_in_bulk in zip(int_idxs, guessed_int_sites_in_bulk, strict=True):
+        defect_sites_in_bulk[i] = site_in_bulk
+
+    # define defect object sites
+    defect_obj_sites_sc = [
+        defect_site if defect_type == "interstitial" else defect_site_in_bulk
+        for defect_site, defect_type, defect_site_in_bulk in zip(
+            defect_sites,
+            defect_types,
+            defect_sites_in_bulk,
+            strict=True,
+        )
+    ]
+
+    # UNWRAP COMPLEX SITES
+
+    # the complex should be unwrapped once, here according to the sites corresponding to Defect.site.
+    # other sets of sites use the same unwrapping to avoid inconsistent unwrappings eg if a site relaxes
+    # across WS radius
+    # TODO warn if complex span is within relaxation distance of WS radius?
+    unwrapped_obj_fc = _get_unwrapped_complex_fc(bulk_supercell, defect_obj_sites_sc)
+
+    # centroids in the supercell frame
+    bulk_site_centroid, defect_site_centroid = (
+        np.mean(
             [
-                bulk_site.frac_coords + anchor_site.distance_and_image(bulk_site)[1]
-                for bulk_site in defect_sites_in_bulk
+                site.frac_coords + np.rint(obj_fc - site.frac_coords)
+                for site, obj_fc in zip(sites_list, unwrapped_obj_fc, strict=True)
             ],
             axis=0,
         )
+        for sites_list in (defect_sites_in_bulk, defect_sites)
+    )
+
+    # TODO: using bulk_site_centroid to check atom mapping? appropriate?
+    if not skip_atom_mapping_check:
         check_atom_mapping_far_from_defect(
             defect_supercell,
             bulk_supercell,
@@ -655,18 +724,7 @@ def defect_complex_from_structures(
         # in these situations, where there are many possible defect cell translations etc which match the
         # bulk cell...
 
-    # define defect object sites
-    defect_obj_sites_sc = [
-        defect_site if defect_type == "interstitial" else defect_site_in_bulk
-        for defect_site, defect_type, defect_site_in_bulk in zip(
-            defect_sites,
-            defect_types,
-            defect_sites_in_bulk,
-            strict=True,
-        )
-    ]
-
-    # UNWRAP COMPLEX SITES AND TRANSFORM TO PRIMITIVE CELL
+    # TRANSFORM COMPLEX SITES TO PRIMITIVE CELL
 
     primitive_structure = get_primitive_structure(bulk_supercell, symprec=kwargs.get("symprec") or 0.01)
 
@@ -680,9 +738,13 @@ def defect_complex_from_structures(
         for k, v in kwargs.items()
         if k in ["ltol", "stol", "angle_tol", "min_stol", "max_stol", "stol_factor", "comparator"]
     }
-    rel_obj_sites = unwrap_and_transform_to_prim(
-        bulk_supercell, defect_obj_sites_sc, primitive_structure, **sm_kwargs
+    rel_obj_fcs = _transform_complex_fc_to_prim(
+        bulk_supercell, unwrapped_obj_fc, primitive_structure, **sm_kwargs
     )
+    rel_obj_sites = [
+        PeriodicSite(site.species, rel_fc, primitive_structure.lattice, coords_are_cartesian=False)
+        for site, rel_fc in zip(defect_obj_sites_sc, rel_obj_fcs, strict=True)
+    ]
 
     # GET EQUIVALENT COMPLEXES
 
@@ -821,9 +883,25 @@ def defect_complex_from_structures(
     if not return_all_info:
         return complex_defect
 
-    return (complex_defect, all_info)
+    # complex sites (centroids) in the defect/bulk supercell frames
+    defect_site, defect_site_in_bulk = (
+        PeriodicSite(DummySpecies(), centroid, lattice, to_unit_cell=True)
+        for centroid, lattice in [
+            (defect_site_centroid, defect_supercell.lattice),
+            (bulk_site_centroid, bulk_supercell.lattice),
+        ]
+    )
 
-    # TODO: compose together initial defect structures, unrelaxed defect structures etc?
+    return (
+        complex_defect,
+        defect_site,
+        defect_site_in_bulk,
+        [info[3] for info in all_info],  # defect_site_indices, matching sorted point Defects order
+        [info[4] for info in all_info],  # bulk_site_indices, matching sorted point Defects order
+        guessed_initial_complex_structure,
+        unrelaxed_complex_structure,
+        all_info,
+    )
 
 
 def defect_from_structures(
@@ -1146,6 +1224,148 @@ def defect_and_info_from_structures(
     defect_structure_metadata["bulk_site"] = (
         defect_site_in_bulk if bulk_site_index is None else bulk_supercell[bulk_site_index]  # interstitial
     )
+
+    return (
+        defect,
+        defect_site,
+        defect_structure_metadata,
+    )
+
+
+def defect_complex_and_info_from_structures(
+    defect_supercell: Structure,
+    bulk_supercell: Structure,
+    skip_atom_mapping_check: bool = False,
+    _parameter_order_warn: bool = True,
+    **kwargs,
+) -> tuple[DefectComplex, PeriodicSite, dict]:
+    """
+    Generates a corresponding |DefectComplex| object from the supplied bulk and
+    defect supercells (using ``defect_complex_from_structures``), and returns
+    the |DefectComplex| object, the (relaxed) defect complex site in the defect
+    supercell (see ``Returns``), and a dictionary of calculation metadata.
+
+    Keys without a clear corresponding value are None.
+
+    Note that this assumes consistent cell definitions (lattice vectors and
+    bases) for the input defect and bulk supercells, and does not perform any
+    structural re-orientations.
+
+    Args:
+        defect_supercell (|Structure|):
+            Defect structure to use for identifying the defect sites and types.
+        bulk_supercell (|Structure|):
+            Bulk supercell structure.
+        skip_atom_mapping_check (bool):
+            If ``True``, skips the atom mapping check which ensures that the
+            bulk and defect supercell lattice definitions are matched
+            (important for accurate defect site determination and charge
+            corrections). Can be used to speed up parsing when you are sure
+            the cell definitions match (e.g. both supercells were generated
+            with ``doped``). Default is ``False``.
+        **kwargs:
+            Keyword arguments to pass to ``defect_complex_from_structures``;
+            see its docstring (and that of
+            ``defect_and_info_from_structures``).
+
+    Returns:
+        tuple[|DefectComplex|, |PeriodicSite|, dict]:
+            defect (|DefectComplex|):
+                ``doped`` |DefectComplex| object, defined in the primitive
+                structure.
+            defect_site (|PeriodicSite|):
+                ``pymatgen`` |PeriodicSite| object of the defect complex site
+                in the `defect` supercell; the (dummy species) centroid of the
+                `unwrapped` constituent defect sites.
+            defect_structure_metadata (dict):
+                Dictionary containing metadata about the defect complex
+                structure, including:
+
+                - ``guessed_initial_defect_structure``: The guessed initial
+                  defect complex structure (before relaxation).
+                - ``unrelaxed_defect_structure``: The unrelaxed defect complex
+                  structure (similar to
+                  ``guessed_initial_defect_structure``, but with interstitials
+                  at their `relaxed` positions).
+                - ``bulk_site``: The defect complex site in the `bulk`
+                  supercell; the (dummy species) centroid of the `unwrapped`
+                  constituent bulk sites.
+                - ``bulk_sites``: The per-constituent bulk sites (in the bulk
+                  supercell), following the point defect convention (see
+                  ``defect_and_info_from_structures``).
+                - ``defect_site_indices`` / ``bulk_site_indices``: The
+                  per-constituent defect/bulk supercell site indices (``None``
+                  entries for vacancies/interstitials respectively).
+                - ``guessed_initial_defect_sites``: The per-constituent guessed
+                  initial defect sites (before relaxation).
+                - ``guessed_defect_displacements``: The per-constituent
+                  displacements from the guessed initial defect sites to the
+                  `relaxed` sites (``None`` entries for vacancies).
+                - ``defect_site_index``, ``bulk_site_index``,
+                  ``guessed_initial_defect_site``,
+                  ``guessed_defect_displacement``: ``None``; see above.
+    """
+    if _parameter_order_warn:
+        _warn_parameter_order("defect_complex_and_info_from_structures")  # TODO: Remove in doped v4.1
+    defect_structure_metadata: dict[str, Any] = {}
+
+    # identify defect sites, structural information, and create defect complex object:
+    (
+        defect,
+        defect_site,  # complex centroid in the defect supercell frame
+        defect_site_in_bulk,  # complex centroid in the bulk supercell frame
+        defect_site_indices,
+        bulk_site_indices,
+        guessed_initial_complex_structure,
+        unrelaxed_complex_structure,
+        all_info,
+    ) = defect_complex_from_structures(
+        defect_supercell,
+        bulk_supercell,
+        skip_atom_mapping_check=skip_atom_mapping_check,
+        return_all_info=True,
+        _parameter_order_warn=False,
+        **kwargs,
+    )
+
+    defect_structure_metadata["guessed_initial_defect_structure"] = guessed_initial_complex_structure
+    defect_structure_metadata["unrelaxed_defect_structure"] = unrelaxed_complex_structure
+    defect_structure_metadata["defect_site_indices"] = defect_site_indices
+    defect_structure_metadata["bulk_site_indices"] = bulk_site_indices
+    defect_structure_metadata["bulk_site"] = defect_site_in_bulk
+
+    # get per-constituent bulk sites, guessed initial sites, and displacements from complex
+    # generated structures
+    guessed_initial_defect_sites = []
+    guessed_defect_displacements = []
+    bulk_sites = []
+    for constituent_info, defect_site_index, bulk_site_index in zip(
+        all_info, defect_site_indices, bulk_site_indices, strict=True
+    ):
+        constituent_site, constituent_site_in_bulk = constituent_info[1], constituent_info[2]
+        if defect_site_index is not None:  # not a vacancy
+            guessed_initial_site = guessed_initial_complex_structure[defect_site_index]
+            guessed_initial_defect_sites.append(guessed_initial_site)
+            guessed_defect_displacements.append(constituent_site.distance(guessed_initial_site))
+        else:  # vacancy
+            guessed_initial_defect_sites.append(bulk_supercell[bulk_site_index])
+            guessed_defect_displacements.append(None)
+        bulk_sites.append(  # interstitial -> constituent site in bulk (see ``defect_from_structures``)
+            constituent_site_in_bulk if bulk_site_index is None else bulk_supercell[bulk_site_index]
+        )
+
+    defect_structure_metadata["bulk_sites"] = bulk_sites
+    defect_structure_metadata["guessed_initial_defect_sites"] = guessed_initial_defect_sites
+    defect_structure_metadata["guessed_defect_displacements"] = guessed_defect_displacements
+
+    # TODO point-defect-only keys, retained for now as None?
+    for singular_key in (
+        "defect_site_index",
+        "bulk_site_index",
+        "guessed_initial_defect_site",
+        "guessed_defect_displacement",
+    ):
+        defect_structure_metadata[singular_key] = None
 
     return (
         defect,
