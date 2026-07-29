@@ -31,7 +31,7 @@ from tqdm import tqdm
 from doped.complexes import (
     _get_complex_orbit_in_prim,
     _get_unwrapped_complex_fc,
-    _transform_complex_fc_to_prim,
+    _unwrap_and_transform_to_prim,
 )
 from doped.core import Defect, DefectComplex, DefectEntry, guess_and_set_oxi_states_with_timeout
 from doped.generation import (
@@ -689,13 +689,17 @@ def defect_complex_from_structures(
     # across WS radius
     # TODO warn if complex span is within relaxation distance of WS radius?
     unwrapped_obj_fc = _get_unwrapped_complex_fc(bulk_supercell, defect_obj_sites_sc)
+    image_cells = [  # the (integer) cell each constituent is unwrapped into, shared by all site sets
+        np.rint(obj_fc - site.frac_coords)
+        for site, obj_fc in zip(defect_obj_sites_sc, unwrapped_obj_fc, strict=True)
+    ]
 
     # centroids in the supercell frame
     bulk_site_centroid, defect_site_centroid = (
         np.mean(
             [
-                site.frac_coords + np.rint(obj_fc - site.frac_coords)
-                for site, obj_fc in zip(sites_list, unwrapped_obj_fc, strict=True)
+                site.frac_coords + image_cell
+                for site, image_cell in zip(sites_list, image_cells, strict=True)
             ],
             axis=0,
         )
@@ -738,13 +742,9 @@ def defect_complex_from_structures(
         for k, v in kwargs.items()
         if k in ["ltol", "stol", "angle_tol", "min_stol", "max_stol", "stol_factor", "comparator"]
     }
-    rel_obj_fcs = _transform_complex_fc_to_prim(
-        bulk_supercell, unwrapped_obj_fc, primitive_structure, **sm_kwargs
+    rel_obj_sites = _unwrap_and_transform_to_prim(  # reusing the complex unwrapping from above
+        bulk_supercell, defect_obj_sites_sc, primitive_structure, image_cells=image_cells, **sm_kwargs
     )
-    rel_obj_sites = [
-        PeriodicSite(site.species, rel_fc, primitive_structure.lattice, coords_are_cartesian=False)
-        for site, rel_fc in zip(defect_obj_sites_sc, rel_obj_fcs, strict=True)
-    ]
 
     # GET EQUIVALENT COMPLEXES
 
@@ -1102,6 +1102,7 @@ def defect_and_info_from_structures(
     defect_supercell: Structure,
     bulk_supercell: Structure,
     skip_atom_mapping_check: bool = False,
+    parse_complex: bool = False,  # TODO temporary?
     _parameter_order_warn: bool = True,
     **kwargs,
 ) -> tuple[Defect, PeriodicSite, dict]:
@@ -1130,6 +1131,8 @@ def defect_and_info_from_structures(
             corrections). Can be used to speed up parsing when you are sure
             the cell definitions match (e.g. both supercells were generated
             with ``doped``). Default is ``False``.
+        parse_complex (bool):
+            Temporary flag for routing to complex parsing pathway.
         **kwargs:
             Keyword arguments to pass to ``get_equiv_frac_coords_in_primitive``
             (such as ``symprec``, ``dist_tol_factor``,
@@ -1184,6 +1187,16 @@ def defect_and_info_from_structures(
     """
     if _parameter_order_warn:
         _warn_parameter_order("defect_and_info_from_structures")  # TODO: Remove in doped v4.1
+
+    if parse_complex:  # TODO merge complex/point parsing?
+        return defect_complex_and_info_from_structures(
+            defect_supercell,
+            bulk_supercell,
+            skip_atom_mapping_check=skip_atom_mapping_check,
+            _parameter_order_warn=False,
+            **kwargs,
+        )
+
     defect_structure_metadata: dict[str, Any] = {}
 
     # identify defect site, structural information, and create defect object:
@@ -3287,6 +3300,7 @@ class DefectParser:
                     "user_charges",
                     "fixed_symprec_and_dist_tol_factor",
                     "verbose",
+                    "parse_complex",  # TODO may remove
                 ]
             },
         )

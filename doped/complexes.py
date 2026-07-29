@@ -1406,17 +1406,28 @@ def _cluster_complex_frac_coords(
     )
 
 
+# TODO UNWRAPPING CRITERION - min distance to boundary over all sites' WS cells,
+# or only anchor's WS cell?
 def _get_unwrapped_complex_fc(
     bulk_supercell: Structure,
     sites: list[PeriodicSite],
+    boundary_tol: float = 1.0,
 ) -> list[np.ndarray]:
     """
     Unwrap a set of (defect complex) sites in a bulk supercell, returning their
     (un-wrapped) fractional coordinates in the supercell frame.
 
-    The sites are unwrapped to the unique complex or (with warning) to the
-    complex with the smallest span. The ordering of the input sites is
-    unchanged.
+    The complex is unwrapped about an anchor site, chosen such that the intersite
+    vectors lie well within the Wigner-Seitz cell boundary. The first such anchor
+    is used (the others then give the same complex, up to a lattice translation).
+    If no anchor achieves this, the unwrapping whose intersite vectors are
+    furthest inside the cell is taken (with compactness as a tie-break), and a
+    warning is issued that the supercell may be too small for the complex.
+
+    Only the anchor separations decide which periodic images are taken, so these
+    are used for a second (ambiguity) warning: if any lies within
+    ``boundary_tol`` of the anchor's Wigner-Seitz cell boundary, then relaxation
+    of that scale could give a different unwrapping.
 
     Args:
         bulk_supercell (|Structure|):
@@ -1424,6 +1435,10 @@ def _get_unwrapped_complex_fc(
         sites (list[|PeriodicSite|]):
             Constituent (defect) sites to unwrap, defined in the
             ``bulk_supercell`` frame.
+        boundary_tol (float):
+            Distance (in Å) from a Wigner-Seitz cell boundary within which to
+            warn about unwrapping, e.g. likely relaxation of defect sites.
+            (Default: 1.0)
 
     Returns:
         list[np.ndarray]:
@@ -1432,24 +1447,72 @@ def _get_unwrapped_complex_fc(
     """
     from doped.utils.supercells import get_min_image_distance
 
-    # try first unwrapping
-    max_complex_span = get_min_image_distance(bulk_supercell) / 2
-    unwrapped_fc = [site.frac_coords + sites[0].distance_and_image(site)[1] for site in sites]
-    cart_coords = bulk_supercell.lattice.get_cartesian_coords(unwrapped_fc)
-    complex_span = np.linalg.norm(cart_coords[:, None] - cart_coords, axis=-1).max()
+    # perpendicular distance d to WS boundary is min over L of |L|/2 * (1 - 2L.r/L^2)
+    # which is >= L/2*(1-2r/L) = L/2 - r. so with an initial guess d <= d_min/2 + r with
+    # d_min min image distance then we only need to check L <= d_min + 4r
 
-    # if unwrapping is not unique, get best - anchor with smallest max distance to all other points
-    if complex_span >= max_complex_span:
-        for anchor_site in sites[1:]:
-            candidate_fc = [site.frac_coords + anchor_site.distance_and_image(site)[1] for site in sites]
-            cart_coords = bulk_supercell.lattice.get_cartesian_coords(candidate_fc)
-            candidate_span = np.linalg.norm(cart_coords[:, None] - cart_coords, axis=-1).max()
-            if candidate_span < complex_span:
-                unwrapped_fc, complex_span = candidate_fc, candidate_span
+    lattice = bulk_supercell.lattice
+    cart = lattice.get_cartesian_coords
+    d_min = get_min_image_distance(bulk_supercell)
+
+    n_sites = len(sites)
+    select_on_anchor_ws = False  # True to select unwrappings on the anchor's WS cell only
+    best: tuple[tuple[float, float, float], list[np.ndarray], np.ndarray, float, float] | None = None
+    # test anchors to get best unwrapping
+    for anchor_idx, anchor in enumerate(sites):
+        candidate_fc = [site.frac_coords + anchor.distance_and_image(site)[1] for site in sites]
+        candidate_cc = cart(candidate_fc)
+        separations = (candidate_cc[:, None] - candidate_cc).reshape(-1, 3)  # (n^2, 3)
+        r_max = np.linalg.norm(separations, axis=1).max()
+
+        # get candidate lattice vectors
+        *_, lattice_ints = lattice.get_points_in_sphere(  # 1.01 factor for rounding issue
+            np.array([[0, 0, 0]]), [0, 0, 0], r=(d_min + 4 * r_max) * 1.01, zip_results=False
+        )
+        lattice_ints = np.array(lattice_ints)
+        lattice_vecs = lattice_ints[np.any(lattice_ints != 0, axis=1)] @ lattice.matrix
+        l_norms = np.linalg.norm(lattice_vecs, axis=1)
+
+        # perpendicular distance d to WS boundary is min over L of |L|/2 * (1 - 2L.r/L^2)
+        ws_distances = (l_norms**2 / 2 - separations @ lattice_vecs.T) / l_norms  # (n^2, n_L)
+        margin = float(ws_distances.min())  # over all intersite separations
+
+        # margin to boundary of anchor's WS cell
+        anchor_margin = float(ws_distances[anchor_idx * n_sites : (anchor_idx + 1) * n_sites].min())
+
+        # return if unwrapping unambiguous
+        if margin >= boundary_tol:
+            return candidate_fc
+
+        # otherwise keep the largest margin from boundary, then tiebreak by compactness, then by the
+        # margin in anchor WS cell only
+        key = (
+            -(anchor_margin if select_on_anchor_ws else margin),
+            float(np.var(candidate_cc, axis=0).sum()),
+            -anchor_margin,
+        )
+        if best is None or key < best[0]:
+            best = (key, candidate_fc, candidate_cc, margin, anchor_margin)
+
+    _key, unwrapped_fc, cart_coords, margin, anchor_margin = cast(
+        "tuple[tuple[float, float, float], list[np.ndarray], np.ndarray, float, float]", best
+    )
+    span = np.linalg.norm(cart_coords[:, None] - cart_coords, axis=-1).max()
+    position = (  # negative margin -> complex size actually exceeds cell
+        f"lies {margin:.2f} Å from"
+        if margin >= 0
+        else f"extends {-margin:.2f} Å beyond (i.e. is not a minimum image of)"
+    )
+    # TODO is this in scope
+    warnings.warn(
+        f"A defect complex separation {position} a Wigner-Seitz cell boundary of the supercell "
+        f"(complex span: {span:.2f} Å). The supercell may be too small for this complex."
+    )
+    if anchor_margin < boundary_tol:  # an anchor separation could take a different image if relaxed
         warnings.warn(
-            f"The defect complex spans {complex_span:.2f} Å, which is greater than half the min "
-            f"image distance of the supercell ({max_complex_span:.2f} Å). The unwrapped complex "
-            f"may be ambiguous."
+            f"A defect complex site lies {anchor_margin:.2f} Å from the Wigner-Seitz cell boundary of "
+            f"the anchor site, so the unwrapped complex may be ambiguous; a relaxation of this scale "
+            f"could give a different unwrapping."
         )
 
     return unwrapped_fc
@@ -1529,6 +1592,7 @@ def _unwrap_and_transform_to_prim(
     sites: list[PeriodicSite],
     primitive_structure: Structure | None = None,
     symprec: float = 0.01,
+    image_cells: list[np.ndarray] | np.ndarray | None = None,
     **sm_kwargs,
 ) -> list[PeriodicSite]:
     """
@@ -1536,9 +1600,9 @@ def _unwrap_and_transform_to_prim(
     them into the primitive host frame.
 
     The sites are first unwrapped to the unique complex or (with warning)
-    to the complex with the smallest span. They are then transformed to the
-    primitive basis, such that the centroid lands in the unit primitive cell.
-    The ordering of the input sites is unchanged.
+    to the complex with the smallest span relative to the cell. They are then
+    transformed to the primitive basis, such that the centroid lands in the
+    unit primitive cell. The ordering of the input sites is unchanged.
 
     Args:
         bulk_supercell (|Structure|):
@@ -1553,6 +1617,9 @@ def _unwrap_and_transform_to_prim(
         symprec (float):
             Symmetry precision for computing the primitive structure, if not
             provided. (Default: 0.01)
+        image_cells (list[np.ndarray] | np.ndarray | None):
+            Provide a list of cells (np.ndarray[int]) for a specified unwrapping,
+            to skip automatic unwrapping.
         **sm_kwargs:
             Additional keyword arguments for the supercell-to-primitive
             transformation (``get_transformation_from_s2_to_s1``, i.e.
@@ -1567,9 +1634,14 @@ def _unwrap_and_transform_to_prim(
     if primitive_structure is None:
         primitive_structure = get_primitive_structure(bulk_supercell, symprec=symprec)
 
+    unwrapped_fc = (
+        _get_unwrapped_complex_fc(bulk_supercell, sites)
+        if image_cells is None
+        else [site.frac_coords + image for site, image in zip(sites, image_cells, strict=True)]
+    )
     rel_obj_fcs = _transform_complex_fc_to_prim(
         bulk_supercell,
-        _get_unwrapped_complex_fc(bulk_supercell, sites),
+        unwrapped_fc,
         primitive_structure,
         symprec=symprec,
         **sm_kwargs,

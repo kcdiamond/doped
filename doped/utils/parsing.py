@@ -2327,6 +2327,7 @@ def _update_defect_entry_structure_metadata(
             ``defect_and_info_from_structures`` function.
     """
     from doped.analysis import defect_and_info_from_structures
+    from doped.core import DefectComplex
 
     bulk_supercell = _get_bulk_supercell(defect_entry)
     defect_supercell = _get_defect_supercell(defect_entry)
@@ -2337,6 +2338,7 @@ def _update_defect_entry_structure_metadata(
     ) = defect_and_info_from_structures(
         defect_supercell,
         bulk_supercell,
+        parse_complex=isinstance(defect_entry.defect, DefectComplex),  # TODO temporary?
         _parameter_order_warn=False,
         **kwargs,  # pass any additional kwargs (e.g. oxidation state, multiplicity, etc.)
     )

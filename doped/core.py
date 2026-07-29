@@ -3456,8 +3456,14 @@ class DefectComplex(core.DefectComplex, Defect):
                     [defect.site for defect in cplx.defects],
                     primitive_structure=primitive,
                     symprec=dist_tol,
+                    # if structure is primitive, assume already unwrapped
+                    image_cells=(
+                        np.zeros((len(cplx.defects), 3), dtype=int)
+                        if len(cplx.structure) == len(cplx_prim)
+                        else None
+                    ),
                 )
-                for cplx in (self, other)
+                for cplx, cplx_prim in ((self, primitive), (other, prim_2))
             ]
         except RuntimeError:  # structures don't match
             return False
