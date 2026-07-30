@@ -1355,6 +1355,7 @@ def _create_unrelaxed_complex_structure(
     return unrelaxed_defect_structure
 
 
+# ??
 def get_wigner_seitz_radius(lattice: Structure | Lattice) -> float:
     """
     Calculates the Wigner-Seitz radius of the structure, which corresponds to

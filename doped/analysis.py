@@ -686,8 +686,7 @@ def defect_complex_from_structures(
 
     # the complex should be unwrapped once, here according to the sites corresponding to Defect.site.
     # other sets of sites use the same unwrapping to avoid inconsistent unwrappings eg if a site relaxes
-    # across WS radius
-    # TODO warn if complex span is within relaxation distance of WS radius?
+    # across WS cell boundary
     unwrapped_obj_fc = _get_unwrapped_complex_fc(bulk_supercell, defect_obj_sites_sc)
     image_cells = [  # the (integer) cell each constituent is unwrapped into, shared by all site sets
         np.rint(obj_fc - site.frac_coords)

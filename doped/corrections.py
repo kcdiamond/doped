@@ -10,7 +10,7 @@ The charge-correction methods implemented are:
    robust in cases of small supercells.
    Includes:
 
-       a) anisotropic PC energy.
+       a) anisotropic PC energy (optionally multiple PCs).
        b) potential alignment by atomic site averaging outside Wigner Seitz
           radius.
 
@@ -65,6 +65,7 @@ from doped.utils.parsing import (
     get_wigner_seitz_radius,
 )
 from doped.utils.plotting import doped_plot_style, format_defect_name
+from doped.utils.supercells import _get_min_image_distance_from_matrix
 
 
 def _monty_decode_nested_dicts(d):
@@ -340,6 +341,7 @@ def get_kumagai_correction(
     dielectric: float | np.ndarray | list | None = None,
     defect_region_radius: float | None = None,
     excluded_indices: list[int] | None = None,
+    point_charges: list[tuple[float, np.ndarray | list]] | None = None,
     defect_outcar: PathLike | Outcar | None = None,
     bulk_outcar: PathLike | Outcar | None = None,
     plot: bool = False,
@@ -409,6 +411,14 @@ def get_kumagai_correction(
             List of site indices (in the defect supercell) to exclude from
             the site potential sampling in the correction calculation/plot.
             If ``None`` (default), no sites are excluded.
+        point_charges (list[tuple[float, ArrayLike]]):
+            List of ``(charge, frac_coords)`` pairs specifying a multicentre
+            point-charge model (e.g. for constituent point defects of a
+            defect complex), used in place of the default single point charge.
+            The charges should sum to the defect charge state. TODO: Currently
+            the sites sampled from alignment are based on the distance from the
+            nearest point charge, not the overall defect site.
+            Default is ``None`` (single point charge).
         defect_outcar (PathLike or |Outcar|):
             Path to the output ``VASP`` ``OUTCAR`` file from the defect
             supercell calculation, or the corresponding ``pymatgen`` |Outcar|
@@ -448,6 +458,10 @@ def get_kumagai_correction(
         from pydefect.defaults import defaults
         from pydefect.util.error_classes import SupercellError
 
+    # TODO switch for sampling away from all charges vs sampling away from defect_coords
+    # (probably the centroid)
+    sample_away_from_all_charges = True
+
     def doped_make_efnv_correction(
         charge: float,
         calc_results: CalcResults,
@@ -458,6 +472,7 @@ def get_kumagai_correction(
         accuracy: float = defaults.ewald_accuracy,
         unit_conversion: float = 180.95128169876497,
         excluded_indices: list | None = None,
+        point_charges: list[tuple[float, np.ndarray | list]] | None = None,
     ):
         r"""
         This is a modified version of ``pydefect``\'s ``make_efnv_correction``
@@ -465,7 +480,9 @@ def get_kumagai_correction(
         defect region radius to be adjusted (e.g. in cases of layered
         materials, where often the defect charge is localised to one layer, so
         we likely want to adjust the defect region radius to ensure that only
-        `other` layers are used for the sampling (plateau) region).
+        `other` layers are used for the sampling (plateau) region), and to
+        allow the model charge to be split over multiple point charges (e.g.
+        over the constituent point defects of a defect complex).
 
         If defect_region_radius is not specified, then the ``pydefect`` default
         (which is the Wigner-Seitz region of the supercell) is used.
@@ -473,6 +490,20 @@ def get_kumagai_correction(
         if calc_results.structure.lattice != perfect_calc_results.structure.lattice:
             raise SupercellError("The lattice constants for defect and perfect models are different")
         lattice = calc_results.structure.lattice
+
+        if point_charges is not None:
+            pc_charges, pc_frac_coords = zip(*point_charges, strict=True)
+            if not abs(sum(pc_charges) - charge) < 1e-2:
+                raise ValueError(
+                    f"The sum of the supplied point charges ({np.sum(pc_charges):+.3f}) does not "
+                    f"match the total defect charge state ({charge:+.3f})."
+                )
+        else:
+            pc_charges = [charge]
+            pc_frac_coords = [defect_coords]
+        pc_charges = np.array(pc_charges, dtype=float)
+        pc_frac_coords = np.array(pc_frac_coords, dtype=float)
+
         sites, rel_coords = [], []
 
         excluded_indices = [] if excluded_indices is None else [int(i) for i in excluded_indices]
@@ -485,10 +516,22 @@ def get_kumagai_correction(
             if d not in excluded_indices and not any(i is None for i in [d, p]):
                 specie = str(calc_results.structure[d].specie)
                 frac_coords = calc_results.structure[d].frac_coords
-                distance, _ = lattice.get_distance_and_image(defect_coords, frac_coords)
+
+                # TODO distance to the nearest point charge right now
+                distance = (
+                    min(
+                        lattice.get_distance_and_image(pc_coords, frac_coords)[0]
+                        for pc_coords in pc_frac_coords
+                    )
+                    if sample_away_from_all_charges
+                    else lattice.get_distance_and_image(defect_coords, frac_coords)[0]
+                )
                 pot = calc_results.potentials[d] - perfect_calc_results.potentials[p]
+
                 sites.append(PotentialSite(specie, distance, pot, None))
-                rel_coords.append([x - y for x, y in zip(frac_coords, defect_coords, strict=False)])
+
+                # rel coords to all centres to reconstruct model potential
+                rel_coords.append([(frac_coords - pc_coords).tolist() for pc_coords in pc_frac_coords])
 
         ewald = Ewald(lattice.matrix, dielectric_tensor, accuracy=accuracy)
 
@@ -510,17 +553,65 @@ def get_kumagai_correction(
 
         Ewald.ewald_real = ewald_real
         Ewald.ewald_rec = ewald_rec
-        point_charge_correction = -ewald.lattice_energy * charge**2 if charge else 0.0
 
+        # for multi centre: point charge correction is linear so
+        # E_corr = 1/2 * sum over i,j [q_i*q_j*(v_periodic(r_ij)-v_isolated(r_ij))]
+        # plus alignment?
+        point_charge_correction = 0.0
+        d_min = 0.5 * _get_min_image_distance_from_matrix(lattice.matrix)
+        if np.any(pc_charges):
+            # self image term correction i=j
+            point_charge_correction = -ewald.lattice_energy * np.sum(pc_charges**2)
+
+            # cross image term correction i<j
+            for i, (q_i, x_i) in enumerate(zip(pc_charges, pc_frac_coords, strict=True)):
+                for j, (q_j, x_j) in enumerate(zip(pc_charges, pc_frac_coords, strict=True)):
+                    if j <= i or not (q_i and q_j):
+                        continue
+                    d_ij, image = lattice.get_distance_and_image(x_i, x_j)
+                    x_ij = x_j + image - x_i
+
+                    # catch coincident charges
+                    if d_ij < 0.1:
+                        raise ValueError(
+                            f"Point charges {i} and {j} are (near-)coincident (separation "
+                            f"{d_ij:.2f} Å), giving a divergent point-charge model -- these "
+                            f"should be combined into a single point charge!"
+                        )
+
+                    # validity of multicentre
+                    if d_ij > d_min:
+                        warnings.warn(
+                            f"Point charge separation ({d_ij:.2f} Å) exceeds half the minimum "
+                            f"image distance of the supercell ({d_min:.2f} Å), so the multicentre "
+                            f"point-charge model may be unreliable."
+                        )
+
+                    v_periodic = ewald.atomic_site_potential(x_ij.tolist())
+                    r_ij = lattice.get_cartesian_coords(x_ij)
+                    v_isolated = 1 / (
+                        4 * np.pi * ewald.root_epsilon * np.sqrt(r_ij @ ewald.epsilon_inv @ r_ij)
+                    )
+                    point_charge_correction += -q_i * q_j * (v_periodic - v_isolated)
+
+        # ? this is not WS radius in efnv paper (min_image_distance/2)?
         if defect_region_radius is None:
             defect_region_radius = get_wigner_seitz_radius(lattice)
 
-        for site, rel_coord in zip(sites, rel_coords, strict=False):
+        # model potential is just sum of point charge potentials
+        for site, site_rel_coords in zip(sites, rel_coords, strict=False):
             if site.distance > defect_region_radius:
-                if charge == 0:
+                if not np.any(pc_charges):
                     site.pc_potential = 0
                 else:
-                    site.pc_potential = ewald.atomic_site_potential(rel_coord) * charge * unit_conversion
+                    site.pc_potential = (
+                        sum(
+                            pc_charge * ewald.atomic_site_potential(rel_coord)
+                            for pc_charge, rel_coord in zip(pc_charges, site_rel_coords, strict=False)
+                            if pc_charge
+                        )
+                        * unit_conversion
+                    )
 
         return ExtendedFnvCorrection(
             charge=charge,
@@ -601,6 +692,7 @@ def get_kumagai_correction(
         ),  # _relaxed_ defect coords (except for vacancies)
         defect_region_radius=defect_region_radius,
         excluded_indices=excluded_indices,
+        point_charges=point_charges,
         **kwargs,
     )
     kumagai_correction_result = CorrectionResult(
@@ -659,7 +751,12 @@ def get_kumagai_correction(
         ]
         ax.legend_.remove()
         ax.legend(handles, labels, loc="best", borderaxespad=0, fontsize=8)
-        ax.set_xlabel(f"Distance from defect ({spp._x_unit})", size=spp._mpl_defaults.label_font_size)
+        x_label = (
+            "Distance from nearest PC"
+            if point_charges and sample_away_from_all_charges
+            else "Distance from defect"
+        )
+        ax.set_xlabel(f"{x_label} ({spp._x_unit})", size=spp._mpl_defaults.label_font_size)
 
     if filename:
         spp.plt.savefig(filename, bbox_inches="tight", transparent=True)
