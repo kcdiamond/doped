@@ -5,7 +5,7 @@ Code to analyse site displacements around defects.
 import warnings
 from collections.abc import Callable, Sequence
 from copy import deepcopy
-from typing import Any
+from typing import Any, cast
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -14,13 +14,14 @@ import pandas as pd
 from pymatgen.util.coord import pbc_shortest_vectors
 from pymatgen.util.typing import PathLike
 
-from doped.core import DefectEntry
+from doped.core import DefectComplex, DefectEntry
 from doped.generation import _get_element_list
 from doped.utils.parsing import (
     _get_bulk_supercell,
     _get_defect_supercell,
     _get_defect_supercell_frac_coords,
     _get_defect_supercell_site,
+    _update_defect_entry_structure_metadata,
     get_matching_site,
     get_site_mappings,
 )
@@ -51,6 +52,9 @@ def calc_site_displacements(
     The signed displacements are stored in the calculation_metadata of the
     |DefectEntry| object under the ``"site_displacements"`` key.
 
+    For defect complexes, distances and relative displacements are measured to
+    the closest constituent point defect site.
+
     Args:
         defect_entry (|DefectEntry|):
             |DefectEntry| object.
@@ -80,8 +84,14 @@ def calc_site_displacements(
         ``pandas`` ``DataFrame`` with site displacements (compared to pristine
         supercell), and other displacement-related information.
     """
-    bulk_sc, defect_sc_with_site, defect_site_index = _get_bulk_struct_with_defect(defect_entry)
-    defect_site = defect_sc_with_site[defect_site_index]
+    if isinstance(defect_entry.defect, DefectComplex):
+        bulk_sc, defect_sc_with_site, defect_site_indices = _get_bulk_struct_with_defect_complex(
+            defect_entry
+        )
+    else:
+        bulk_sc, defect_sc_with_site, defect_site_index = _get_bulk_struct_with_defect(defect_entry)
+        defect_site_indices = [defect_site_index]
+    defect_sites = [defect_sc_with_site[index] for index in defect_site_indices]
 
     # Map sites in defect supercell to bulk supercell:
     mappings = get_site_mappings(defect_sc_with_site, bulk_sc, threshold=threshold)
@@ -108,8 +118,9 @@ def calc_site_displacements(
         # First final point, then initial point
         disp = pbc_shortest_vectors(bulk_sc.lattice, bulk_site.frac_coords, site.frac_coords)[0, 0]
 
-        # Distance to defect site (last site in defect sc)
+        # Distance to defect site (or closest one for defect complexes)
         atomic_site = site if relaxed_distances else bulk_site
+        defect_site = min(defect_sites, key=lambda ds: ds.distance_and_image(atomic_site)[0])
         distance = defect_site.distance_and_image(atomic_site)[0]
         disp_dict["Species"].append(site.specie.name)
         disp_dict["Distance to defect"].append(distance)
@@ -162,22 +173,14 @@ def calc_site_displacements(
         + ["Index (defect supercell)"]
     ]
 
-    # Store in DefectEntry.calculation_metadata
-    # For vacancies, before storing displacements data, remove the last site
-    # (defect site) as not present in input defect supercell
-    # But leave it in disp_df as clearer to include in the displacement plot
-    disp_vectors_list = deepcopy(list(disp_df["Displacement vector"]))
-    distance_list = deepcopy(list(disp_df["Distance to defect"]))
-    if defect_entry.defect.defect_type.name == "Vacancy":
-        # get idx of value closest to zero:
-        min_idx = min(range(len(distance_list)), key=lambda i: abs(distance_list[i]))
-        if np.isclose(distance_list[min_idx], 0, atol=1e-2):  # just to be sure
-            disp_vectors_list.pop(min_idx)
-            distance_list.pop(min_idx)
+    # Store displacements data but first remove all vacancy sites appended to defect supercell
+    # But leave them in disp_df as clearer to include in the displacement plot
+    in_defect_sc = disp_df["Index (defect supercell)"] < len(_get_defect_supercell(defect_entry))
     # Store in DefectEntry.calculation_metadata
     defect_entry.calculation_metadata["site_displacements"] = {
-        "displacements": disp_vectors_list,  # Ordered by site index in defect supercell
-        "distances": distance_list,
+        # Ordered by species then distance?
+        "displacements": deepcopy(list(disp_df["Displacement vector"][in_defect_sc])),
+        "distances": deepcopy(list(disp_df["Distance to defect"][in_defect_sc])),
     }
 
     return disp_df
@@ -1102,8 +1105,7 @@ def plot_displacements_ellipsoid(
     return_list = []
     # If ellipsoid plotting is enabled, plot the ellipsoid with the given lattice matrix
     if plot_ellipsoid:
-        bulk_sc, _defect_sc_with_site, _defect_site_index = _get_bulk_struct_with_defect(defect_entry)
-        lattice_matrix = bulk_sc.as_dict()["lattice"]["matrix"]
+        lattice_matrix = _get_bulk_supercell(defect_entry).lattice.matrix
         func: Callable[..., Any] = _plotly_plot_ellipsoid if use_plotly else _mpl_plot_ellipsoid
         args = [ellipsoid_center, ellipsoid_radii, ellipsoid_rotation, points, lattice_matrix]
         if not use_plotly:
@@ -1192,3 +1194,53 @@ def _get_bulk_struct_with_defect(defect_entry: DefectEntry) -> tuple:
     else:
         raise ValueError(f"Defect type {defect_type} not supported")
     return bulk_sc_with_defect, defect_sc_with_defect, defect_site_index
+
+
+def _get_bulk_struct_with_defect_complex(defect_entry: DefectEntry) -> tuple:
+    """
+    ``_get_bulk_struct_with_defect`` for defect complexes.
+
+    Returns tuple of ``(bulk_sc_with_defect, defect_sc_with_defect,
+    defect_site_indices)`` with one (defect supercell) site index per
+    constituent point defect.
+    """
+    bulk_sc_with_defect = _get_bulk_supercell(defect_entry).copy()
+    defect_sc_with_defect = _get_defect_supercell(defect_entry).copy()
+    defect_site_indices = []
+
+    if not (getattr(defect_entry, "calculation_metadata", None) or {}).get("bulk_sites"):
+        _update_defect_entry_structure_metadata(defect_entry)
+
+    for point_defect, bulk_site, defect_site_index in zip(
+        cast("DefectComplex", defect_entry.defect).defects,
+        defect_entry.calculation_metadata["bulk_sites"],
+        defect_entry.calculation_metadata["defect_site_indices"],  # None for vacancies
+        strict=True,
+    ):
+        defect_type = point_defect.defect_type.name
+        if defect_type == "Vacancy":  # Add Vacancy atom to defect structure
+            defect_sc_with_defect.append(point_defect.site.specie, bulk_site.frac_coords)
+        elif defect_type == "Interstitial":  # If Interstitial, add interstitial site to bulk structure
+            bulk_sc_with_defect.append(
+                point_defect.site.specie,
+                defect_sc_with_defect[
+                    defect_site_index
+                ].frac_coords,  # relaxed site (bulk site might be guessed)
+            )
+        elif defect_type == "Substitution":  # If Substitution, replace site in bulk supercell
+            bulk_sc_with_defect.replace(
+                bulk_sc_with_defect.index(get_matching_site(bulk_site.frac_coords, bulk_sc_with_defect)),
+                point_defect.site.specie,
+                bulk_site.frac_coords,
+            )
+        else:
+            raise ValueError(
+                f"Defect type {defect_type} is not vacancy, substitution or interstitial."
+                f"Could not generate bulk struct with defect."
+            )
+
+        defect_site_indices.append(  # the added site for vacancies
+            len(defect_sc_with_defect) - 1 if defect_type == "Vacancy" else defect_site_index
+        )
+
+    return bulk_sc_with_defect, defect_sc_with_defect, defect_site_indices

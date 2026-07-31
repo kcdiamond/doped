@@ -536,6 +536,7 @@ def defect_complex_from_structures(
         PeriodicSite,
         list[int | None],
         list[int | None],
+        list[PeriodicSite],
         Structure,
         Structure,
         list[tuple[Defect, PeriodicSite, PeriodicSite, int | None, int | None, Structure, Structure]],
@@ -620,6 +621,13 @@ def defect_complex_from_structures(
             Indices of the constituent defect sites in the bulk supercell
             (``None`` entries for interstitials), matching the ordering of
             ``defect.defects``.
+        defect_sites_in_bulk (list[|PeriodicSite|]):
+            The constituent defect sites in the `bulk` supercell (matching the
+            ordering of ``defect.defects``), following the same convention as
+            for point defects, but with the guessed initial interstitial sites
+            determined for the complex as a whole (see
+            ``_guess_initial_complex_structure``) rather than the naive
+            per-constituent guesses in ``all_point_info``.
         guessed_initial_complex_structure (|Structure|):
             ``pymatgen`` |Structure| object of the guessed initial defect
             complex structure.
@@ -759,7 +767,7 @@ def defect_complex_from_structures(
     # GENERATE POINT DEFECT OBJECTS
 
     point_defects = []
-    all_info = []
+    all_point_info = []
     for defect_idx, defect_site_info in enumerate(defect_sites_info):
         (
             defect_site,
@@ -846,11 +854,11 @@ def defect_complex_from_structures(
         point_defects.append(defect)
 
         if return_all_info:
-            all_info.append(
+            all_point_info.append(
                 (
                     defect,
                     defect_site,
-                    defect_site_in_bulk,
+                    defect_site_in_bulk,  # note may differ from complex defect_sites_in_bulk rn
                     defect_site_index,
                     bulk_site_index,
                     guessed_initial_defect_structure,
@@ -873,7 +881,8 @@ def defect_complex_from_structures(
     point_defects = [point_defects[i] for i in sort_index]
     orbit = [[member[i] for i in sort_index] for member in orbit]
     if return_all_info:
-        all_info = [all_info[i] for i in sort_index]
+        all_point_info = [all_point_info[i] for i in sort_index]
+        defect_sites_in_bulk = [defect_sites_in_bulk[i] for i in sort_index]
 
     # RETURN COMPLEX
 
@@ -895,11 +904,12 @@ def defect_complex_from_structures(
         complex_defect,
         defect_site,
         defect_site_in_bulk,
-        [info[3] for info in all_info],  # defect_site_indices, matching sorted point Defects order
-        [info[4] for info in all_info],  # bulk_site_indices, matching sorted point Defects order
+        [info[3] for info in all_point_info],  # defect_site_indices, matching sorted point Defects order
+        [info[4] for info in all_point_info],  # bulk_site_indices, matching sorted point Defects order
+        defect_sites_in_bulk,
         guessed_initial_complex_structure,
         unrelaxed_complex_structure,
-        all_info,
+        all_point_info,
     )
 
 
@@ -1328,6 +1338,7 @@ def defect_complex_and_info_from_structures(
         defect_site_in_bulk,  # complex centroid in the bulk supercell frame
         defect_site_indices,
         bulk_site_indices,
+        defect_sites_in_bulk,  # complex (not point) guessed interstitial sites
         guessed_initial_complex_structure,
         unrelaxed_complex_structure,
         all_info,
@@ -1351,10 +1362,10 @@ def defect_complex_and_info_from_structures(
     guessed_initial_defect_sites = []
     guessed_defect_displacements = []
     bulk_sites = []
-    for constituent_info, defect_site_index, bulk_site_index in zip(
-        all_info, defect_site_indices, bulk_site_indices, strict=True
+    for constituent_info, defect_site_index, bulk_site_index, constituent_site_in_bulk in zip(
+        all_info, defect_site_indices, bulk_site_indices, defect_sites_in_bulk, strict=True
     ):
-        constituent_site, constituent_site_in_bulk = constituent_info[1], constituent_info[2]
+        constituent_site = constituent_info[1]
         if defect_site_index is not None:  # not a vacancy
             guessed_initial_site = guessed_initial_complex_structure[defect_site_index]
             guessed_initial_defect_sites.append(guessed_initial_site)

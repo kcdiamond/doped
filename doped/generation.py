@@ -2477,9 +2477,10 @@ def _get_element_list(defect: Defect | DefectEntry | dict | list) -> list[str]:
         return element_list
 
     if isinstance(defect, Defect | DefectEntry | core.Defect | thermo.DefectEntry):
-        return _get_single_defect_element_list(
-            defect if isinstance(defect, Defect | core.Defect) else defect.defect
-        )
+        single_defect = defect if isinstance(defect, Defect | core.Defect) else defect.defect
+        if isinstance(single_defect, core.DefectComplex):  # constituent species, not dummy centroid
+            return _get_element_list(single_defect.defects)
+        return _get_single_defect_element_list(single_defect)
 
     # else is dict/list
     defect_list = defect if isinstance(defect, list) else list(defect.values())
