@@ -1281,6 +1281,122 @@ def get_ideal_supercell_matrix(
     return optimal_P
 
 
+def get_ideal_complex_supercell_matrix(
+    structure: Structure,
+    cart_coords: np.ndarray,
+    min_image_distance: float = 10.0,
+    min_atoms: int = 50,
+    force_cubic: bool = False,
+    force_diagonal: bool = False,
+    ideal_threshold: float = 0.1,
+    verbose: bool = False,
+    pbar: tqdm | None = None,
+) -> np.ndarray:
+    """
+    Determine the ideal supercell matrix for a defect complex in the given
+    structure, based on the complex minimum image distance (i.e. the minimum
+    distance between any constituent point defect and a constituent point
+    defect of a periodic image), minimum number of atoms and
+    ``ideal_threshold``.
+
+    The equivalent of ``get_ideal_supercell_matrix`` for defect complexes.
+    In addition to the different metric, the supercell search is currently
+    exhaustive, instead of based on a scan around a guessed FCC/SC shape,
+    which may not be good candidates for a complex defect.
+
+    Sizes are preferred which give a diagonal expansion of the
+    primitive/conventional cell, then which give the largest minimum image distance,
+    then which are smallest.
+
+    Args:
+        structure (|Structure|): Unit cell structure to generate a supercell of.
+        cart_coords (np.ndarray):
+            ``(n, 3)`` array of Cartesian coordinates of the constituent
+            point defect sites of the complex, unwrapped.
+        min_image_distance (float):
+            Minimum complex minimum image distance (in Å) for the supercell.
+            (Default = 10.0)
+        min_atoms (int):
+            Minimum number of atoms in the supercell. (Default = 50)
+        force_cubic (bool):
+            Whether to return the most cubic supercell satisfying the above
+            criteria, rather than that with the largest complex minimum image
+            distance. Note that, unlike for point defects, this is done by
+            doped using the same exhaustive search rather than using
+            the ``pymatgen`` ``CubicSupercellTransformation``, which optimises
+            the single-site minimum image distance. (Default = False)
+        force_diagonal (bool):
+            As ``force_cubic``, but additionally requiring a diagonal supercell
+            transformation matrix. (Default = False)
+        ideal_threshold (float):
+            Threshold for scanning larger supercell sizes, as a fraction of the
+            smallest satisfactory size. Not used if ``force_cubic`` or
+            ``force_diagonal`` is set, as the supercell shape is then already
+            constrained. (Default = 0.1; i.e. 10% larger)
+        verbose (bool):
+            Whether to print out extra information about the supercell search.
+            (Default = False)
+        pbar (tqdm):
+            ``tqdm`` progress bar object to update (for internal ``doped``
+            usage). Default is ``None``.
+
+    Returns:
+        Ideal supercell matrix (``np.ndarray``).
+    """
+    # smallest size which could possibly satisfy both criteria
+    target_size = max(
+        int(np.ceil(min_atoms / len(structure))),
+        supercells._get_min_complex_target_size(structure.lattice.matrix, cart_coords, min_image_distance),
+    )
+
+    def _trial(size: int) -> tuple[np.ndarray, float]:
+        if pbar is not None:
+            pbar.set_description(f"Trialling size = {size} unit cells...")
+        return supercells.find_ideal_complex_supercell(  # type: ignore[return-value]
+            structure.lattice.matrix,
+            cart_coords,
+            target_size=size,
+            return_min_dist=True,
+            force_cubic=force_cubic,
+            force_diagonal=force_diagonal,
+            verbose=verbose,
+        )
+
+    # trial target sizes until min image dist hit
+    optimal_P, best_min_dist = _trial(target_size)
+    while best_min_dist < min_image_distance:
+        target_size += 1
+        optimal_P, best_min_dist = _trial(target_size)
+
+    if force_cubic or force_diagonal:  # constrained - no gain by searching higher?
+        return optimal_P
+
+    # test up to threshold
+    candidates = [(target_size, optimal_P, best_min_dist)]
+    for alt_target_size in range(target_size + 1, int(np.ceil(target_size * (1 + ideal_threshold))) + 1):
+        alt_optimal_P, alt_min_dist = _trial(alt_target_size)
+        if alt_min_dist >= min_image_distance:
+            candidates.append(
+                (
+                    alt_target_size,
+                    supercells._check_and_return_scalar_matrix(alt_optimal_P, structure.lattice.matrix),
+                    alt_min_dist,
+                )
+            )
+
+    target_size, optimal_P, best_min_dist = min(  # diagonal, then max distance, then smallest size
+        candidates,
+        key=lambda x: (round(supercells._min_sum_off_diagonals(structure, x[1])) != 0, -x[2], x[0]),
+    )
+
+    if pbar is not None:
+        pbar.set_description(
+            f"Best min distance: {best_min_dist:.2f} Å, with size = {target_size} unit cells"
+        )
+
+    return optimal_P
+
+
 class DefectsGenerator(MSONable):
     """
     Class for generating ``doped`` |DefectEntry| objects.
