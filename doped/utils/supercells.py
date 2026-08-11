@@ -197,10 +197,9 @@ def _get_complex_min_image_distance_from_matrix(matrix: np.ndarray, cart_coords:
     Returns:
         float: Complex minimum image distance.
     """
-    # all separations r_b - r_a between constituent sites, including a == b (the zero vector), which
-    # gives the site-with-its-own-images terms:
+    # all separations r_b - r_a between constituent sites, including a == b (the zero vector)
     intra_vecs = (cart_coords[:, None, :] - cart_coords[None, :, :]).reshape(-1, 3)  # (n^2, 3)
-    complex_span = np.linalg.norm(intra_vecs, axis=1).max()  # largest separation; the complex 'diameter'
+    complex_span = np.linalg.norm(intra_vecs, axis=1).max()  # largest separation within complex
 
     # evaluate min image distance here instead for better bound?
     # -> not really faster
@@ -223,6 +222,99 @@ def _get_complex_min_image_distance_from_matrix(matrix: np.ndarray, cart_coords:
         )
 
     return round(min_dist, 4)  # round to 4 decimal places to avoid issues with tiny numerical differences
+
+
+def _get_complex_ws_radius(
+    matrix: np.ndarray, cart_coords: np.ndarray, point: np.ndarray | None = None
+) -> float:
+    r"""
+    Defining the complex WS cell as the set of points closer to a constituent
+    point defect than any image point defect, ie the union of Voronoi cells of
+    the constituent point defects, returns the closest distance to the complex
+    WS cell boundary.
+
+    Measured from the complex centroid by default, but from any given ``point``
+    of the cell if provided.
+
+    Note that the complex WS cell is a union of Voronoi cells so is not necessarily
+    convex, and so this is not necessarily equal to the perpendicular distance to
+    some bisecting plane.
+
+    Args:
+        matrix (np.ndarray): Lattice matrix.
+        cart_coords (np.ndarray):
+            ``(n, 3)`` array of Cartesian coordinates of the constituent
+            point defect sites of the complex, unwrapped.
+        point (np.ndarray):
+            Cartesian coordinates of the point to measure from. If ``None``
+            (default), the complex centroid is used.
+
+    Returns:
+        float:
+            Complex Wigner-Seitz radius; zero if ``point`` lies outside the
+            complex WS cell (i.e. is closer to an image constituent than to
+            any constituent of the provided complex).
+    """
+    cart_coords = np.asarray(cart_coords)
+    origin = cart_coords.mean(axis=0) if point is None else np.asarray(point, dtype=float)
+    constituent_vecs = cart_coords - origin  # (n, 3), from the origin (centroid by default)
+    c_max = float(np.linalg.norm(constituent_vecs, axis=1).max())  # largest distance to constituent
+
+    # closest bisector of an image constituent at v is (|v|-c_max)/2
+    # upper bound on the closest image constituent is |u| <= d_min + c_max
+    # so nearest boundary <= d_min/2 + c_max
+    # therefore only test lattice points R for which (|v|-c_max)/2 <= d_min/2 + c_max
+    # ie R <= d_min + 4*c_max
+    lattice = Lattice(matrix)
+    max_min_dist = lattice.volume ** (1 / 3) * 2 ** (1 / 6)
+    _fcoords, _dists, _idxs, images = lattice.get_points_in_sphere(  # while the cell itself reaches no
+        np.array([[0, 0, 0]]), [0, 0, 0], r=(max_min_dist + 4 * c_max) * 1.01, zip_results=False
+    )
+    images = np.array(images)
+    lattice_vecs = images[np.any(images != 0, axis=1)] @ matrix  # no R = 0 (this complex itself)
+    image_vecs = (constituent_vecs[:, None, :] + lattice_vecs[None, :, :]).reshape(-1, 3)
+    # (n_point*n_R, 3) = (m, 3)
+
+    # bisecting planes are 2x.(q_j - c_i) = q_j^2 - c_i^2 for image constituent q_j, complex
+    # constituents c_i
+    normals = image_vecs[:, None, :] - constituent_vecs[None, :, :]  # (m, n, 3)
+    offsets = (
+        (image_vecs**2).sum(axis=1)[:, None] - (constituent_vecs**2).sum(axis=1)[None, :]
+    ) / 2  # (m, n)
+    plane_dists = (offsets / np.linalg.norm(normals, axis=-1)).max(axis=1)  # (m,) nearest bounding plane
+    if plane_dists.min() <= 0:  # the origin lies outside complex WS cell
+        if point is not None:
+            return 0.0
+        raise ValueError(
+            "Defect complex is closer to its own periodic images than to itself! This is possibly due to "
+            "a co-planar / linearly dependent lattice, or a lattice small relative to the complex. "
+            "Please check your inputs!"
+        )
+
+    # the complex WS cell is not necessarily convex - we have to check for nearest vertices, edges
+    # not just perpendicular plane distances. only intersections over image's planes: for a constituent
+    # we are inside a convex voronoi cell
+    actives = [  # faces, edges, vertices
+        list(subset) for size in (1, 2, 3) for subset in combinations(range(len(constituent_vecs)), size)
+    ]
+    radius = np.inf
+    # over set of p <= 3 planes {i} from an image constituent:
+    # under constraint n_i.x = d_i, we solve for min |x| ie L = x.T*x - 2a.T*(N*x-d)
+    # where N_ji = (n_i)_j then x = N.T @ a and N @ x = d -> x = N.T @ inv(N @ N.T) @ d
+    for i in np.argsort(plane_dists):  # loop over image constituents, nearest bounding plane first
+        if plane_dists[i] >= radius:
+            break  # cannot be closer than perpendicular distance so none remaining
+        for active in actives:
+            try:
+                proj = normals[i][active].T @ np.linalg.solve(
+                    normals[i][active] @ normals[i][active].T, offsets[i][active]
+                )
+            except np.linalg.LinAlgError:  # parallel etc taken care of at smaller p
+                continue
+            if np.all(normals[i] @ proj >= offsets[i] - 1e-9):  # inside the rest so in the region
+                radius = min(radius, float(np.linalg.norm(proj)))
+
+    return round(radius, 4)  # round to 4 decimal places to avoid tiny numerical differences
 
 
 def _largest_cube_length_from_matrix(matrix: np.ndarray, max_ijk: int = 10) -> float:

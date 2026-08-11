@@ -848,7 +848,7 @@ def get_point_defect_types_and_site_indices(
             and defect_idx is not None
             and dist is not None
             and sub_dist_tol is not None
-            and dist <= sub_dist_tol
+            and dist <= sub_dist_tol  # TODO ...
         ):
             point_defects.append(("substitution", bulk_idx, defect_idx))
         else:
@@ -2302,6 +2302,41 @@ def _get_defect_supercell_site(defect_entry: "DefectEntry", relaxed=True, **kwar
     _update_defect_entry_structure_metadata(defect_entry, **kwargs)
 
     return _return_defect_supercell_site(defect_entry, relaxed=relaxed)
+
+
+def _get_defect_supercell_sites(defect_entry: "DefectEntry", **kwargs) -> list[PeriodicSite] | None:
+    """
+    Get the constituent point defect sites of a defect `complex`, in the defect
+    supercell frame: the `relaxed` site for interstitials/substitutions, else
+    the vacated bulk site (as returned by ``defect_sites_from_structures``).
+
+    Returns ``None`` if ``defect_entry`` is not a defect complex, or if the
+    constituent site information could not be determined.
+    """
+    from doped.core import DefectComplex
+
+    if not isinstance(defect_entry.defect, DefectComplex):
+        return None
+
+    def _return_defect_supercell_sites(defect_entry: "DefectEntry"):
+        metadata = getattr(defect_entry, "calculation_metadata", None) or {}
+        if metadata.get("bulk_sites") and metadata.get("defect_site_indices"):
+            defect_supercell = _get_defect_supercell(defect_entry)
+            return [  # ``defect_site_indices`` is ``None`` for vacancies (no atom in the defect supercell)
+                defect_supercell[index] if index is not None else bulk_site
+                for bulk_site, index in zip(
+                    metadata["bulk_sites"], metadata["defect_site_indices"], strict=True
+                )
+            ]
+        return None
+
+    if defect_supercell_sites := _return_defect_supercell_sites(defect_entry):
+        return defect_supercell_sites
+
+    # otherwise need to reparse info:
+    _update_defect_entry_structure_metadata(defect_entry, **kwargs)
+
+    return _return_defect_supercell_sites(defect_entry)
 
 
 def _update_defect_entry_structure_metadata(

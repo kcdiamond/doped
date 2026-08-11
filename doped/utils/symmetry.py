@@ -29,17 +29,23 @@ from scipy.spatial.distance import squareform
 from sympy import Eq, Expr, simplify, solve
 from tqdm import tqdm
 
-from doped.core import Defect, DefectEntry, template_defect_entry_from_structures
+from doped.core import Defect, DefectComplex, DefectEntry, template_defect_entry_from_structures
 from doped.utils.configurations import orient_s2_like_s1
 from doped.utils.efficiency import PeriodicSite, SpacegroupAnalyzer, Structure
 from doped.utils.parsing import (
     _get_bulk_supercell,
     _get_defect_supercell,
     _get_defect_supercell_frac_coords,
+    _get_defect_supercell_sites,
     _get_site_mapping_from_coords_and_indices,
     get_site_mappings,
 )
-from doped.utils.supercells import get_min_image_distance, min_dist
+from doped.utils.supercells import (
+    _get_complex_min_image_distance_from_matrix,
+    _get_complex_ws_radius,
+    get_min_image_distance,
+    min_dist,
+)
 
 
 @lru_cache(maxsize=int(1e5))
@@ -2960,20 +2966,34 @@ def point_symmetry_from_defect(
 
 
 def _extract_defect_cluster(
-    structure: Structure, centre_cart: np.ndarray, radius: float
+    structure: Structure,
+    centre_cart: np.ndarray,
+    radii: np.ndarray,
+    centres: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Extract the atoms within ``radius`` of ``centre_cart`` in ``structure``
+    Extract the atoms within ``radii`` of ``centre_cart`` in ``structure``
     (PBC-aware), returning their Cartesian coordinates `relative` to
     ``centre_cart``, and their element symbols.
+
+    If ``centres`` is given (the constituent point defect sites of a defect
+    complex, relative to ``centre_cart``), the cluster is instead the union of
+    the spheres about each of those centres, (possibly each with its own radius,
+    ``radii``).
 
     Args:
         structure (|Structure|):
             The structure to extract the local atomic cluster from.
         centre_cart (np.ndarray):
-            Cartesian coordinates of the extraction sphere centre.
-        radius (float):
-            Radius (in Å) of the extraction sphere.
+            Cartesian coordinates of the extraction sphere centre, which the
+            returned coordinates are relative to.
+        radii (np.ndarray):
+            ``(M,)`` radii (in Å) of the extraction spheres, one per centre.
+        centres (np.ndarray | None):
+            ``(M, 3)`` Cartesian coordinates of the local cluster centres of a
+            defect complex (its constituent point defects, and its centroid),
+            `relative` to ``centre_cart``. If ``None`` (default), a single sphere about
+            ``centre_cart``.
 
     Returns:
         tuple[np.ndarray, np.ndarray]:
@@ -2983,10 +3003,45 @@ def _extract_defect_cluster(
     # Note: We could instead work with ``pymatgen`` ``Site``/``Molecule`` objects here and in the local
     # symmetry functions, to simplify some of the API, but this would incur significant overhead from many
     # property accesses / array unpacking (e.g. Site.specie -> Composition init), so avoided for now.
-    sites = structure.get_sites_in_sphere(centre_cart, radius)
+    sites, seen = [], set()
+    sphere_centres = centre_cart + centres if centres is not None else [centre_cart]
+    for centre, radius in zip(sphere_centres, np.ravel(radii), strict=True):
+        for site in structure.get_sites_in_sphere(centre, radius):
+            # dedupe same site in multiple spheres. note also won't give multiple periodic images
+            # of an atom - we assume cluster resides in a single WS cell/complex WS cell
+            if site.index not in seen:
+                seen.add(site.index)
+                sites.append(site)
+
     coords = np.array([site.coords for site in sites]).reshape(-1, 3) - centre_cart
     species = np.array([site.specie.symbol for site in sites])
     return coords, species
+
+
+def _cluster_dists(coords: np.ndarray, centres: np.ndarray | None = None) -> np.ndarray:
+    """
+    Distance of each coordinate to the `nearest` local cluster centre, not PBC
+    aware.
+
+    With ``centres = None`` (point defect), this is distance from the origin.
+    """
+    if centres is None:  # only the origin; note a single _given_ centre need not be at the origin
+        return np.linalg.norm(coords, axis=1)
+    return np.linalg.norm(coords[:, None, :] - centres[None, :, :], axis=-1).min(axis=1)
+
+
+def _cluster_margins(
+    coords: np.ndarray, radii: np.ndarray, centres: np.ndarray | None = None
+) -> np.ndarray:
+    """
+    Signed distance of each coordinate to the nearest cluster boundary
+    (negative inside), not PBC aware.
+
+    With ``centres = None`` (point defect), this is ``|x| - radius``.
+    """
+    if centres is None:
+        return np.linalg.norm(coords, axis=1) - np.ravel(radii)[0]
+    return (np.linalg.norm(coords[:, None, :] - centres[None, :, :], axis=-1) - radii).min(axis=1)
 
 
 def _matching_rot_index(
@@ -3199,19 +3254,29 @@ def _map_residual(
     trees: dict | None = None,
     rotation: np.ndarray | None = None,
     translation: np.ndarray | None = None,
-    radius: float | None = None,
+    radii: np.ndarray | float | None = None,
     symprec: float = 0.1,
-    dists: np.ndarray | None = None,
+    margins: np.ndarray | None = None,
+    centres: np.ndarray | None = None,
+    centre_error: float = 0.0,
 ) -> tuple[bool, float, int]:
     """
     Maximum nearest-neighbour residual (displacement) mapping test atoms with
     ``x -> rotation @ x + translation``.
 
-    An atom is tested if and only if its predicted image lands within
-    ``radius - symprec`` of the centre, where its true partner (within
+    An atom is tested if and only if its predicted image lands more than
+    ``symprec`` inside the cluster boundary, where its true partner (within
     ``symprec``, if the operation is genuine) is guaranteed to be inside the
-    extracted local sphere -- so boundary truncation can never falsely reject
+    extracted local cluster -- so boundary truncation can never falsely reject
     a true operation, while every observable atom image is still checked.
+
+    For defect complexes: if any ``centres`` land less than
+    ``centre_error + symprec`` from the cluster boundary, the operation is
+    rejected (ensuring the defects themselves, known only to within
+    ``centre_error``, map into the tested region), as this is likely not
+    a symmetry operation of the complex (the cluster of a complex is not
+    invariant under rotation like a sphere). If there is risk of falsely rejecting
+    a valid operation due to this check, this is warned for in ``local_point_symmetry``.
 
     Args:
         coords (np.ndarray):
@@ -3229,35 +3294,56 @@ def _map_residual(
         translation (np.ndarray | None):
             Candidate operation translation vector (Cartesian). Defaults to
             the zero vector.
-        radius (float | None):
-            Radius (in Å) of the local environment extraction sphere. If
-            ``None`` (default), set to ``max(dists) + symprec`` so the provided
-            cluster is fully observable.
+        radii (np.ndarray | float | None):
+            ``(M,)`` radii (in Å) of the local environment extraction spheres,
+            one per centre. If ``None`` , set to ``max(dists) + symprec`` to account for entire cluster.
         symprec (float):
             Distance tolerance (in Å), as in ``local_point_symmetry``.
             Default is 0.1 Å.
-        dists (np.ndarray | None):
-            ``(N,)`` precomputed distances of each atom from the centre
-            (norms of ``coords``). If ``None`` or empty (default),
+        margins (np.ndarray | None):
+            ``(N,)`` precomputed signed distances of each atom to the cluster
+            boundary (``_cluster_margins``). If ``None`` or empty (default),
             recomputed from ``coords``.
+        centres (np.ndarray | None):
+            ``(M, 3)`` local cluster centres (relative to the same origin as
+            ``coords``), when the cluster is a union of spheres (a defect
+            complex). If ``None`` (default), a single sphere about the origin.
+        centre_error (float):
+            Accuracy (in Å) of the given cluster centre(s), for avoiding mapping
+            centres outside the cluster under the operation.
 
     Returns:
         tuple[bool, float, int]:
             ``(accepted, max_residual, n_tested)``: whether the operation
             was accepted, the maximum nearest-neighbour mapping residual
-            (displacement) in Å, and the number of atoms tested.
+            (displacement) in Å, and the number of atoms tested -- ``-1``
+            when the operation was rejected due to mapping a centre outside
+            the cluster.
     """
-    dists = np.linalg.norm(coords, axis=1) if dists is None or len(dists) == 0 else dists
     trees = trees or {sp: KDTree(coords[species == sp]) for sp in set(species)}
     rotation = np.eye(3) if rotation is None else rotation
     translation = np.zeros(3) if translation is None else translation
-    if radius is None:
-        radius = float(dists.max()) + symprec
+    if radii is None:  # the smallest radius
+        radii = float(_cluster_dists(coords, centres).max()) + symprec
+    radii = np.broadcast_to(np.asarray(radii, dtype=float), (1 if centres is None else len(centres),))
+    if margins is None or len(margins) == 0:
+        margins = _cluster_margins(coords, radii, centres)
 
     mapped = coords @ rotation.T + translation  # apply the candidate operation to all atoms
 
-    # only test atoms whose images land observably inside the sphere; ``coords`` are relative to centre:
-    mask = np.linalg.norm(mapped, axis=1) < radius - symprec  # mask for sites within radius - symprec
+    # guarantee that each defect remains in the tested region, ie a sphere of centre_error about
+    # the given centre remains in the tested region. this is necessary to prevent false
+    # certification of operations for which the defects don't end up in the test region and only a
+    # pristine region ends up getting tested
+    # check centroid -> centroid sphere and constituents -> constituent sphere?
+    centre_coords = np.zeros((1, 3)) if centres is None else centres
+    mapped_centres = centre_coords @ rotation.T + translation
+    centre_margins = _cluster_margins(mapped_centres, radii, centres)
+    if centres is not None and np.any(centre_margins > -(centre_error + symprec)):
+        return False, np.inf, -1
+
+    # only test atoms whose images land observably inside the cluster; ``coords`` are relative to centre:
+    mask = _cluster_margins(mapped, radii, centres) < -symprec  # mask for sites inside by > symprec
     n_test, max_residual = int(mask.sum()), 0.0
 
     # enforce minimum test-set size to prevent vacuous certification (a spurious operation trivially
@@ -3266,9 +3352,12 @@ def _map_residual(
     # Some near-boundary atoms may be untestable due to noise/truncation effects, but upstream ``t_max``
     # handling should ensure this is never a majority of the test set (preventing any true ops from
     # breaking here):
-    n_guaranteed = (dists < radius - symprec - np.linalg.norm(translation)).sum()  # guaranteed testable
+    n_guaranteed = (margins < -symprec - np.linalg.norm(translation)).sum()  # guaranteed testable
     if n_test == 0 or n_test < round(0.5 * n_guaranteed):  # vacuous test region -> cannot certify anything
         return False, np.inf, n_test
+    # TODO don't think the second condition ever fires on develop either? guaranteed region is always
+    # subset of tested region? what's the intention eg n_tested_for_identity = (margins < -symprec).sum()
+    # then n_test < round(0.5 * n_tested_for_identity)?
 
     # per-species nearest-neighbour residual, early exit on failure:
     for _sp, _sp_mask, nn_dists, _nn_idxs in _mapped_species_matches(species, trees, mapped, mask):
@@ -3323,10 +3412,11 @@ def _refine_symm_op(
     species_coords: dict,
     rotation: np.ndarray,
     translation: np.ndarray,
-    radius: float,
+    radii: np.ndarray,
     symprec: float,
     match_tol: float,
     refine_rotation: bool = False,
+    centres: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Refine a candidate ``(rotation, translation)`` operation against matched
@@ -3351,7 +3441,7 @@ def _refine_symm_op(
     """
     for _ in range(3 if refine_rotation else 1):  # rematch & refit when refining R; one-shot for t-only:
         mapped = coords @ rotation.T + translation  # map atoms with the current candidate operation
-        mask = np.linalg.norm(mapped, axis=1) < radius - symprec  # only test images within local sphere
+        mask = _cluster_margins(mapped, radii, centres) < -symprec  # only test images within the cluster
         matched_src, matched_dst = [], []
         # match mapped atoms to their nearest same-species partner:
         for species_symbol, species_mask, nn_dists, nn_idxs in _mapped_species_matches(
@@ -3435,17 +3525,6 @@ def _schoenflies_from_cartesian_ops(rotations: Sequence[np.ndarray]) -> str:
     return symbol
 
 
-def _defect_coords_from_structures(defect_supercell: Structure, bulk_supercell: Structure) -> np.ndarray:
-    """
-    Cartesian defect-site coordinates from bulk vs defect structure comparison.
-    """
-    from doped.analysis import defect_site_from_structures  # avoid circular import
-
-    site = defect_site_from_structures(defect_supercell, bulk_supercell, _parameter_order_warn=False)
-    assert isinstance(site, PeriodicSite)
-    return site.coords
-
-
 def local_point_symmetry(
     defect_supercell: Structure,
     bulk_supercell: Structure | None = None,
@@ -3454,6 +3533,7 @@ def local_point_symmetry(
     centre_error_range: float | None = None,
     bulk_symprec: float = 0.01,
     verbose: bool = False,
+    complex_sites: Sequence[PeriodicSite] | None = None,  # TODO switch to fc
     _first_pass: bool = True,
 ) -> tuple[str, list[tuple[np.ndarray, np.ndarray]], dict]:
     r"""
@@ -3473,7 +3553,7 @@ def local_point_symmetry(
     cluster size:
 
     1. Place a rough cluster centre at the defect site (``defect_frac_coords``;
-       else taken from ``defect_site_from_structures`` if ``bulk_supercell``
+       else taken from ``defect_sites_from_structures`` if ``bulk_supercell``
        provided, or ``guess_defect_position`` without), and extract the local
        atomic cluster with this centre point and a radius equal to half the
        minimum periodic image distance.
@@ -3504,6 +3584,15 @@ def local_point_symmetry(
        placement can alter cluster membership (test region) and flip the
        symmetry assignment in either direction.
 
+       For a defect complex, the cluster used is instead the union of spheres
+       about each constituent point defect, with a radius of half the complex
+       minimum image distance, as well as a sphere about the complex centroid,
+       with the largest radius that fits in the complex WS cell. For a suitably
+       large supercell relative to the complex, this will give a roughly
+       spherical cluster like for a point defect, but in smaller supercells this
+       allows recovery of the symmetry around the local environment of each point
+       defect.
+
     Args:
         defect_supercell (|Structure|):
             The defect (supercell) structure.
@@ -3512,7 +3601,7 @@ def local_point_symmetry(
             If provided, candidate rotations are taken from the bulk crystal
             symmetry (recommended; most robust) and the defect position (if not
             provided) is determined from bulk vs defect structure comparison
-            (``defect_site_from_structures``). Otherwise, candidate operations
+            (``defect_sites_from_structures``). Otherwise, candidate operations
             are generated directly from the atomic geometry about the (guessed)
             defect position. Default is ``None``.
         defect_frac_coords (ArrayLike | None):
@@ -3526,8 +3615,10 @@ def local_point_symmetry(
             supercells; see ``centre_error_range``) to be recovered, with the
             recentring re-run typically extending this somewhat further. If
             ``None`` (default), the defect position is taken from
-            ``defect_site_from_structures`` when ``bulk_supercell`` is
-            provided, or ``guess_defect_position`` otherwise.
+            ``defect_sites_from_structures`` when ``bulk_supercell`` is
+            provided (with multiple sites there giving a defect complex; see
+            ``complex_sites``), or ``guess_defect_position`` otherwise (for
+            which a point defect will be assumed).
         symprec (float):
             Distance tolerance (in Å) for symmetry determination; an operation
             is accepted if it maps each (locally observable) atomic position
@@ -3559,6 +3650,14 @@ def local_point_symmetry(
         verbose (bool):
             If ``True``, prints diagnostic information on the local symmetry
             analysis. Default is ``False``.
+        complex_sites (Sequence[|PeriodicSite|] | None):
+            The constituent point defect sites of a defect complex. If given,
+            the local cluster is the union of the spheres about each of these,
+            rather than a single sphere about the defect position, allowing
+            symmetry analysis of the local environment of each point defect.
+            This should be given for complexes unless the minimum image distance
+            of the supercell is very much greater than the span of the complex.
+            The sites do not have to be provided unwrapped.
 
     Returns:
         tuple[str, list, dict]:
@@ -3584,28 +3683,82 @@ def local_point_symmetry(
               small supercells or sparse/vacuum-spaced structures), in which
               case ``C1`` is returned here, and global ``spglib`` analysis of
               the defect supercell is used instead by
-              |point_symmetry_from_defect_entry| (where determinable).
+              |point_symmetry_from_defect_entry| (where determinable). For a
+              defect complex, this is the atom count within every constituent
+              point defect's sphere, rather than the union cluster as a whole.
             - ``"empty_cluster"``: whether the local cluster contained no atoms
               besides the defect itself (e.g. adsorbates/defects in
-              vacuum-spaced low-dimensional structures), in which case ``C1``
-              is returned here, but nothing local can have relaxed/distorted
-              and so the (unrelaxed) bulk site symmetry is the appropriate
-              relaxed point symmetry (used automatically by
+              vacuum-spaced low-dimensional structures; for a defect complex,
+              about all of its constituent point defects), in which case
+              ``C1`` is returned here, but nothing local can have
+              relaxed/distorted and so the (unrelaxed) bulk site symmetry is
+              the appropriate relaxed point symmetry (used automatically by
               |point_symmetry_from_defect_entry|).
+            - ``"undersized_cluster"``: whether the supercell is too small for
+              a defect complex to be analysed at all: the radius allowed
+              by the complex minimum image distance does not reach the
+              first coordination shell of each constituent, so no radius both
+              resolves their environments and avoids the complex's periodic
+              images, and nothing can be certified at any constituent position
+              accuracy. ``C1`` is returned here, and global ``spglib`` analysis
+              of the defect supercell is used instead by
+              |point_symmetry_from_defect_entry| (where determinable). Always
+              ``False`` for a single point defect.
+            - ``"max_centre_error"``: for a defect `complex`, the largest error
+              in the given constituent positions that allows reliable symmetry
+              determination. If lower than the given ``centre_error_range``
+              (but greater than 0.5 Å), a warning will be emitted but symmetry
+              determination will proceed. (``None`` for a single point defect.)
     """
-    radius = min(get_min_image_distance(defect_supercell) / 2, 12)  # cap at 12 Å for very large supercells
+    # determine the constituent point defect sites of a defect complex, if not provided, from bulk vs
+    # defect structure comparison - multiple defect sites give a complex, while a single site just gives
+    # the defect position:
+    if complex_sites is None and defect_frac_coords is None and bulk_supercell is not None:
+        from doped.analysis import defect_sites_from_structures  # avoid circular import
+
+        sites = cast(
+            "list[PeriodicSite]",
+            defect_sites_from_structures(defect_supercell, bulk_supercell, _parameter_order_warn=False),
+        )
+        if len(sites) > 1:
+            complex_sites = sites
+        else:
+            defect_frac_coords = sites[0].frac_coords
+
+    # for a defect complex, the local cluster is the union of the spheres about each constituent point
+    # defect, with the radius set by half the complex min image distance, as well as a sphere around the
+    # centroid with the largest possible inscribed radius in the complex WS cell (the set of points closer
+    # to any constituent point defect than any image point defect). therefore for small supercells, we
+    # use most of the complex WS cell, but in the large supercell/small complex limit this approaches
+    # the single sphere matching point defects
+    # note that a sphere of radius d_min/2 will generally exceed the complex WS cell, ie will contain
+    # points closer to an image point defect than any in the complex.
+    if complex_sites is None:
+        cplx_cc = None
+        radius = centroid_radius = get_min_image_distance(defect_supercell) / 2
+    else:
+        from doped.complexes import _get_unwrapped_complex_fc  # avoid circular import
+
+        cplx_cc = defect_supercell.lattice.get_cartesian_coords(
+            _get_unwrapped_complex_fc(defect_supercell, list(complex_sites))
+        )
+        matrix = defect_supercell.lattice.matrix
+        radius = _get_complex_min_image_distance_from_matrix(matrix, cplx_cc) / 2
+        centroid_radius = _get_complex_ws_radius(matrix, cplx_cc)
+    radius, centroid_radius = min(radius, 12), min(centroid_radius, 12)  # cap for large supercells
 
     # determine cluster centre:
     # only needs to be accurate to ~centre_error_range, as it is just used to place the local cluster
     # sphere; while the symmetry centre itself is then derived from the fitted symmetry operations (with
     # a recentred re-run if it differs appreciably from the input)
-    if defect_frac_coords is not None:  # use the provided defect position
+    if defect_frac_coords is not None:  # use the provided/determined defect position
         centre_cart = defect_supercell.lattice.get_cartesian_coords(defect_frac_coords)
-    elif bulk_supercell is not None:  # determine from bulk vs defect structure comparison
-        centre_cart = _defect_coords_from_structures(defect_supercell, bulk_supercell)
+    elif cplx_cc is not None:  # the complex centroid, invariant under any valid operation
+        centre_cart = cplx_cc.mean(axis=0)
     else:  # no bulk reference either; guess the defect position
         from doped.analysis import guess_defect_position  # avoid circular import
 
+        # TODO not really possible to do complex parsing here?
         centre_cart = guess_defect_position(defect_supercell)
         if centre_error_range is None:
             centre_error_range = 3.0  # default = 3.0 Å w/guessed position (larger error)
@@ -3613,7 +3766,17 @@ def local_point_symmetry(
     if centre_error_range is None:
         centre_error_range = 1.5  # default = 1.5 Å, except w/``guess_defect_position``
 
-    coords, species = _extract_defect_cluster(defect_supercell, centre_cart, radius)
+    centres, radii = None, np.array([radius])
+    if cplx_cc is not None:
+        # match given defect_frac_coords to complex sites up to lattice vector
+        offset = defect_supercell.lattice.get_fractional_coords(cplx_cc.mean(axis=0) - centre_cart)
+        cplx_cc = cplx_cc - defect_supercell.lattice.get_cartesian_coords(np.round(offset))
+
+        # set up union of spheres
+        centres = np.vstack([cplx_cc, cplx_cc.mean(axis=0)]) - centre_cart
+        radii = np.array([radius] * len(cplx_cc) + [centroid_radius])
+
+    coords, species = _extract_defect_cluster(defect_supercell, centre_cart, radii, centres)
     point_symmetry_info: dict = {
         "closed": True,
         "centre_cart": centre_cart,
@@ -3622,38 +3785,66 @@ def local_point_symmetry(
         "residuals": [],
         "degenerate_cluster": False,
         "empty_cluster": False,
+        "undersized_cluster": False,
+        "max_centre_error": None,
     }
-    if len(coords) < 4:  # degenerate cluster; too few atoms to certify any symmetry -> C1
+    # apply cluster size checks per constituent point defect ie every local environment must be resolved
+    centre_coords = np.zeros((1, 3)) if centres is None else centres  # the origin for a point defect
+    all_dists = np.linalg.norm(  # (N, M) distances of the N cluster atoms to the M cluster centres
+        coords[:, None, :] - centre_coords[None, :, :], axis=-1
+    )
+    dists_to_centres = all_dists if centres is None else all_dists[:, :-1]  # constituents only
+    n_in_test_region = (dists_to_centres < radius - symprec).sum(axis=0)  # the actual testing region
+    degenerate_idxs = [i for i, n_atoms in enumerate(n_in_test_region) if n_atoms < 4]
+    if degenerate_idxs:  # degenerate cluster; too few atoms to certify any symmetry -> C1
         point_symmetry_info["degenerate_cluster"] = True
-        if len(coords) == 0 or not np.any(np.linalg.norm(coords, axis=1) > symprec):
-            # no atoms in the local environment (besides any defect atom at the centre itself; e.g.
+        # over the whole extraction sphere(s) to diagnose - any atom in a sphere other than the defect
+        # atom at its centre
+        if not np.any((dists_to_centres <= radius + 1e-8) & (dists_to_centres > symprec)):
+            # no atoms in the local environment (besides any defect atom at a centre itself; e.g.
             # adsorbates/defects in vacuum-spaced low-dimensional structures), so nothing local can have
             # relaxed/distorted, and the (relaxed) defect point symmetry is the unrelaxed (bulk) site
             # symmetry -- flagged here for the ``relaxed=False`` fallback in
             # ``point_symmetry_from_defect_entry``:
             point_symmetry_info["empty_cluster"] = True
             warnings.warn(
-                f"No atoms within the local symmetry analysis radius ({radius:.2f} Å) of the defect site "
-                f"(besides the defect itself), so the point symmetry cannot be determined from the local "
-                f"environment; returning C1. As nothing local can have relaxed/distorted in this case, "
-                f"the (unrelaxed) bulk site symmetry (``relaxed=False``) is the appropriate relaxed "
-                f"point symmetry -- used automatically when a bulk reference is available (e.g. in "
-                f"``point_symmetry_from_defect_entry`` / ``doped`` parsing)."
+                f"No atoms within the local symmetry analysis radius ({radius:.2f} Å) of the defect "
+                f"site(s) (besides the defect itself), so the point symmetry cannot be determined from "
+                f"the local environment; returning C1. As nothing local can have relaxed/distorted in "
+                f"this case, the (unrelaxed) bulk site symmetry (``relaxed=False``) is the appropriate "
+                f"relaxed point symmetry -- used automatically when a bulk reference is available (e.g. "
+                f"in ``point_symmetry_from_defect_entry`` / ``doped`` parsing)."
             )
         else:  # too few atoms to certify any symmetry operations, but atoms present may have
             # relaxed/distorted (so the bulk site symmetry cannot just be assumed); flagged for global
             # ``spglib`` fallback in ``point_symmetry_from_defect_entry``:
+            if complex_sites is None:
+                sites_str = f"the defect site (only {n_in_test_region[0]} atom(s))"
+            else:
+                degenerate_sites_str = ", ".join(
+                    f"{complex_sites[i].species_string} at "
+                    f"{np.round(complex_sites[i].frac_coords, 3).tolist()} "
+                    f"({n_in_test_region[i]} atom(s))"
+                    for i in degenerate_idxs
+                )
+                sites_str = (
+                    f"{len(degenerate_idxs)} of the {len(complex_sites)} constituent point defect "
+                    f"sites of the defect complex: {degenerate_sites_str}"
+                )
             warnings.warn(
-                f"Only {len(coords)} atom(s) within the local symmetry analysis radius ({radius:.2f} Å) "
-                f"of the defect site; too few to certify any symmetry operations, so the point symmetry "
-                f"cannot be determined from the local environment; returning C1. Global symmetry analysis "
-                f"of the defect supercell (``spglib``) may be more appropriate here -- used automatically "
-                f"in ``point_symmetry_from_defect_entry`` / ``doped`` parsing (though note this can be "
-                f"affected by periodicity-breaking supercell shapes)."
+                f"Too few atoms (< 4 atoms beyond tolerance {symprec:.2f} Å) within the local symmetry "
+                f"analysis radius ({radius:.2f} Å) of "
+                f"{sites_str} to certify any symmetry operations, so the point symmetry cannot be "
+                f"determined from the local environment; returning C1. Global symmetry analysis of the "
+                f"defect supercell (``spglib``) may be more appropriate here -- used automatically in "
+                f"``point_symmetry_from_defect_entry`` / ``doped`` parsing (though note this can be "
+                f"affected by periodicity-breaking supercell shapes). If the analysis radius is small, "
+                f"this supercell may be too small for the defect or defect complex."
             )
         return "C1", [(np.eye(3), np.zeros(3))], point_symmetry_info
 
-    dists = np.linalg.norm(coords, axis=1)  # distances from the cluster centre
+    # distance to nearest centre, max margin to edge of cluster
+    dists, margins = all_dists.min(axis=1), (all_dists - radii).min(axis=1)
     unique_species = sorted(set(species))
 
     # per-species coordinates and KD-trees, for the nearest-neighbour residual queries below:
@@ -3662,11 +3853,76 @@ def local_point_symmetry(
 
     # translation |t| bound: symmetry operation fixed point(s) must stay local (near the defect / cluster
     # centre), and the test region ``(radius - |t| - 2*symprec)`` must cover the defect's first
-    # coordination shell:
-    non_centre_dists = dists[dists > 0.75]  # distances beyond the defect/cluster centre (site) itself
+    # coordination shell.
+    # for a defect complex, same bound using the largest first coordination shell of the constituents
+    # -> smallest t_max (not overly conservative as unlikely for any sphere not to touch boundary of union)
+    first_shell_dists = np.where(dists_to_centres > 0.75, dists_to_centres, np.inf).min(axis=0)
+    first_shell_dists = first_shell_dists[np.isfinite(first_shell_dists)]  # 1st shell of each centre
     min_coordination_shell_distance = (
-        float(non_centre_dists.min()) if non_centre_dists.size else float(dists.min())
-    ) + 0.5  # just past the 1st coordination shell
+        float(first_shell_dists.max()) if first_shell_dists.size else float(dists.min())
+    ) + 0.5
+
+    # for a defect complex, given the distance to the complex WS cell boundary from a constituent
+    # defect is may be somewhat smaller than the distance to the WS cell boundary from a point
+    # defect, the conservative centre_error_range may be too large to allow safe resolution
+    # of the first coordination shell of every defect. therefore we allow centre_error_range to be
+    # lowered, with warning, down to 0.5 Å, instead of spglib/C1 fallback
+    _MIN_CENTRE_ERROR_RANGE = 0.5
+    if centres is not None:
+        max_centre_error = (radius - min_coordination_shell_distance - 2 * symprec) / 2
+        point_symmetry_info["max_centre_error"] = (
+            max_centre_error if max_centre_error < centre_error_range else centre_error_range
+        )
+        if max_centre_error < min(centre_error_range, _MIN_CENTRE_ERROR_RANGE):
+            # symmetry can likely not be determined reliably at all
+            point_symmetry_info["undersized_cluster"] = True
+            reason = (  # no accuracy ok when the radius does not reach the first shell at all
+                f"does not reach the first coordination shell of every constituent point defect "
+                f"({min_coordination_shell_distance - 0.5:.2f} Å), so no symmetry operation can be "
+                f"tested at any constituent-position accuracy."
+                if max_centre_error <= 0
+                else (
+                    f"leaves room to search for symmetry operations only given constituent point defect "
+                    f"positions accurate to {max_centre_error:.2f} Å (the test region must still clear "
+                    f"each constituent's first coordination shell, at "
+                    f"{min_coordination_shell_distance - 0.5:.2f} Å), which is below a reasonable "
+                    f"accuracy for site determination of ({_MIN_CENTRE_ERROR_RANGE:.2f} Å)."
+                )
+            )
+            small_error_msg = (
+                ""
+                if max_centre_error <= 0
+                else (
+                    f"If the constituent positions are known to better than {max_centre_error:.2f} Å, "
+                    f"pass ``centre_error_range`` accordingly to analyse anyway."
+                )
+            )
+            warnings.warn(
+                f"The local symmetry analysis radius for this defect complex ({radius:.2f} Å: half the "
+                f"complex minimum image distance) {reason} A larger radius would extend past half the "
+                f"complex minimum image distance, into atoms whose relaxation is set by a periodic image "
+                f"of the complex rather than by the complex itself, so the local point symmetry cannot "
+                f"be reliably determined here: returning C1. This complex is likely too large "
+                f"for this supercell and a larger supercell may be needed to determine relaxed symmetry. "
+                f"Global symmetry analysis (``spglib``) may be attempted instead, though note this can be "
+                f"affected by periodicity-breaking supercell shapes. {small_error_msg}"
+            )
+            return "C1", [(np.eye(3), np.zeros(3))], point_symmetry_info
+
+        if max_centre_error < centre_error_range:
+            warnings.warn(
+                f"The local symmetry analysis radius for this defect complex ({radius:.2f} Å; half the "
+                f"complex minimum image distance) only leaves room to search for symmetry operations "
+                f"given constituent point defect positions accurate to {max_centre_error:.2f} Å, rather "
+                f"than the requested ``centre_error_range`` of {centre_error_range:.2f} Å (the test "
+                f"region must include each constituent's first coordination shell, at "
+                f"{min_coordination_shell_distance - 0.5:.2f} Å). Proceeding with "
+                f"``centre_error_range = {max_centre_error:.2f}``: the determined point symmetry is "
+                f"reliable only if the constituent positions are accurate to this, and if they are not, "
+                f"the given symmetry may be unreliable. A larger supercell would relax this requirement."
+            )
+            centre_error_range = max_centre_error
+
     t_max = max(min(2 * centre_error_range, radius - 2 * symprec - min_coordination_shell_distance), 1e-3)
     match_tol = max(4 * symprec, 0.5)  # generous pair-matching radius for iterative refinement
 
@@ -3693,12 +3949,21 @@ def local_point_symmetry(
         species,
         trees,
         species_coords,
-        radius=radius,
+        radii=radii,
         symprec=symprec,
         match_tol=match_tol,
+        centres=centres,
     )
     map_residual = partial(
-        _map_residual, coords, species, trees, radius=radius, symprec=symprec, dists=dists
+        _map_residual,
+        coords,
+        species,
+        trees,
+        radii=radii,
+        symprec=symprec,
+        margins=margins,
+        centres=centres,
+        centre_error=centre_error_range,
     )
     for candidate_rotation in rotations:
         # get candidate translations from anchor -> orbit-partner correspondences, deduped within 0.05 Å:
@@ -3732,7 +3997,7 @@ def local_point_symmetry(
     # refine each kept operation's translation by the mean matched-pair offset (removes anchor noise):
     for op in kept:
         rotation, translation = refine_op(op[0], op[1])
-        accepted, residual, _n_test = map_residual(rotation, translation)
+        accepted, residual, _n_test = map_residual(rotation, translation)  # refinement can shift ``t``
         if accepted and residual < op[2]:  # improved residual after refinement; overwrite list entries
             op[:] = [rotation, translation, residual]
 
@@ -3810,6 +4075,7 @@ def local_point_symmetry(
                 centre_error_range=centre_error_range,
                 bulk_symprec=bulk_symprec,
                 verbose=verbose,
+                complex_sites=complex_sites,  # TODO is any refinement of constituents possible
                 _first_pass=False,
             )
             if len(retry_result[1]) > len(kept):  # more certified ops (higher symmetry)
@@ -3917,6 +4183,7 @@ def point_symmetry_from_defect_entry(
             defect_supercell,
             bulk_supercell=_get_bulk_supercell(defect_entry),
             defect_frac_coords=_get_defect_supercell_frac_coords(defect_entry, relaxed=True),
+            complex_sites=_get_defect_supercell_sites(defect_entry),  # ``None`` unless a defect complex
             symprec=symprec,
             verbose=bool(verbose),
             **local_kwargs,
@@ -3937,13 +4204,19 @@ def point_symmetry_from_defect_entry(
                 verbose=verbose,
                 **kwargs,
             )
-        if info.get("degenerate_cluster"):  # too few local atoms to certify any symmetry (warned in
+        if info.get("degenerate_cluster") or info.get("undersized_cluster"):
+            # too few local atoms to certify any symmetry, or (for a defect complex) no radius which both
+            # avoids the complex's periodic images and permits analysis (both warned in
             # ``local_point_symmetry``); fall back to global ``spglib`` analysis:
             with contextlib.suppress(SymmetryUndeterminedError):
                 symbol = schoenflies_from_hermann(
                     get_sga(defect_supercell, symprec=symprec).get_point_group_symbol()
                 )
         return symbol
+
+    if isinstance(defect_entry.defect, DefectComplex):
+        defect_entry.defect.get_multiplicity(symprec=symprec)  # sets ``point_group``, if not already set
+        return cast("str", defect_entry.defect.point_group)
 
     if defect_entry.defect.defect_type != DefectType.Interstitial:  # take from symmetry dataset of bulk:
         symm_dataset = get_sga(defect_entry.defect.structure, symprec=symprec).get_symmetry_dataset()
@@ -4120,6 +4393,7 @@ def point_symmetry_from_structure(
             oxi_state="Undetermined",
             multiplicity=1,
             skip_atom_mapping_check=skip_atom_mapping_check,
+            parse_complex=True,  # TODO remove
         )
 
         return point_symmetry_from_defect_entry(
