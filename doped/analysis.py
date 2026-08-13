@@ -31,12 +31,11 @@ from tqdm import tqdm
 from doped.complexes import (
     _get_complex_orbit_in_prim,
     _get_unwrapped_complex_fc,
+    _sorted_defect_complex,
     _unwrap_and_transform_to_prim,
 )
 from doped.core import Defect, DefectComplex, DefectEntry, guess_and_set_oxi_states_with_timeout
 from doped.generation import (
-    _defect_sort_key,
-    _get_element_list,
     get_defect_name_from_defect,
     get_defect_name_from_entry,
     name_defect_entries,
@@ -868,25 +867,14 @@ def defect_complex_from_structures(
 
     # SORT POINT DEFECTS
 
-    # sort point defects deterministically (matching ``_sort_defects``, then by prim
-    # site coords instead of conv cell for same name), along with accompanying info
-    element_list = _get_element_list(point_defects)
-    sort_index = sorted(
-        range(len(point_defects)),
-        key=lambda i: (
-            _defect_sort_key(point_defects[i], element_list),
-            tuple(np.round(point_defects[i].site.frac_coords, 5)),
-        ),
-    )
-    point_defects = [point_defects[i] for i in sort_index]
-    orbit = [[member[i] for i in sort_index] for member in orbit]
-    if return_all_info:
-        all_point_info = [all_point_info[i] for i in sort_index]
-        defect_sites_in_bulk = [defect_sites_in_bulk[i] for i in sort_index]
-
     # RETURN COMPLEX
 
-    complex_defect = DefectComplex(point_defects, equivalent_complexes=orbit, point_group=point_group)
+    # sorts the point defects deterministically (and the orbit constituents to match), as in
+    # defect complex generation:
+    complex_defect, sort_index = _sorted_defect_complex(point_defects, orbit, point_group=point_group)
+    if return_all_info:  # sort the accompanying info to match
+        all_point_info = [all_point_info[i] for i in sort_index]
+        defect_sites_in_bulk = [defect_sites_in_bulk[i] for i in sort_index]
 
     if not return_all_info:
         return complex_defect

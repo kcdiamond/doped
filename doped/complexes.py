@@ -6,7 +6,7 @@ import contextlib
 import math
 import warnings
 from collections import Counter
-from collections.abc import Iterable, Sequence
+from collections.abc import Hashable, Iterable, Sequence
 from copy import deepcopy
 from functools import lru_cache
 from itertools import combinations, product
@@ -23,7 +23,7 @@ from scipy.cluster.hierarchy import fcluster, linkage
 from spglib import get_pointgroup
 from tqdm import tqdm
 
-from doped.core import _get_oxi_state_modes, guess_and_set_oxi_states_with_timeout
+from doped.core import Defect, DefectComplex, _get_oxi_state_modes, guess_and_set_oxi_states_with_timeout
 from doped.utils.efficiency import Composition, DopedVacancyGenerator, Molecule, PeriodicSite, Structure
 from doped.utils.parsing import (
     get_coords_and_idx_of_species,
@@ -33,6 +33,7 @@ from doped.utils.parsing import (
 )
 from doped.utils.symmetry import (
     _frac_coords_sort_func,
+    cluster_coords,
     get_equiv_frac_coords_in_primitive,
     get_primitive_structure,
     get_sga_and_symprec,
@@ -213,6 +214,7 @@ def _estimate_ES_time(num_candidates: int, cell_size: int) -> float:
     return 1.7e-5 * num_candidates * cell_size**2
 
 
+# TODO DEPRECATED
 def get_equivalent_complex_defect_sites_in_primitive(
     bulk_supercell: Structure,
     vacancy_sites: Iterable[PeriodicSite] | PeriodicSite | None = None,
@@ -549,6 +551,7 @@ def get_equivalent_complex_defect_sites_in_primitive(
     )
 
 
+# TODO DEPRECATED
 def get_complex_defect_multiplicity(
     bulk_supercell: Structure,
     vacancy_sites: Iterable | PeriodicSite | None = None,
@@ -1276,9 +1279,9 @@ def is_periodic_image(
 # maybe should be changed to a consistent metric for large tolerances
 # ie check over all periodic images and assignments for min dist
 def _complex_frac_coords_dist(
-    labels_1: list[str],
+    labels_1: Sequence[Hashable],
     frac_coords_1: np.ndarray,
-    labels_2: list[str],
+    labels_2: Sequence[Hashable],
     frac_coords_2: np.ndarray,
     lattice: Lattice,
 ) -> float:
@@ -1288,12 +1291,12 @@ def _complex_frac_coords_dist(
     complexes. Invariant to integer lattice translations of either complex.
 
     Args:
-        labels_1 (list[str]):
+        labels_1 (Sequence[Hashable]):
             Labels (e.g. species strings) of the point defects in the first
             complex.
         frac_coords_1 (np.ndarray):
             Fractional coordinates of the point defects in the first complex.
-        labels_2 (list[str]):
+        labels_2 (Sequence[Hashable]):
             Labels of the point defects in the second complex.
         frac_coords_2 (np.ndarray):
             Fractional coordinates of the point defects in the second complex.
@@ -1372,7 +1375,7 @@ def cluster_complexes_by_dist_tol(
 
 
 def _cluster_complex_frac_coords(
-    all_labels: list[list[str]],
+    all_labels: Sequence[Sequence[Hashable]],
     all_fcs: np.ndarray | list[np.ndarray],
     lattice: Lattice,
     dist_tol: float = 0.01,
@@ -1385,10 +1388,19 @@ def _cluster_complex_frac_coords(
     if len(all_fcs) == 1:
         return [[0]]
 
+    # mean constituent displacement <= max constituent displacement so centroids displacement
+    # > dist_tol cannot cluster together
+    centroids = np.array([np.mean(fcs, axis=0) for fcs in all_fcs])
+    diffs = centroids[:, None] - centroids  # match centroids, as in _complex_frac_coords_dist
+    no_match = np.linalg.norm((diffs - np.round(diffs)) @ lattice.matrix, axis=-1) > dist_tol
+    no_match &= method == "single" and criterion == "distance"
+
     # make condensed distance array using _complex_frac_coords_dist metric
     condensed_dists = np.array(
         [
-            _complex_frac_coords_dist(all_labels[i], all_fcs[i], all_labels[j], all_fcs[j], lattice)
+            np.inf  # too far apart to cluster
+            if no_match[i, j]
+            else _complex_frac_coords_dist(all_labels[i], all_fcs[i], all_labels[j], all_fcs[j], lattice)
             for i, j in combinations(range(len(all_fcs)), 2)
         ]
     )
@@ -1562,6 +1574,7 @@ def _transform_complex_fc_to_prim(
     from doped.utils.symmetry import _get_supercell_to_prim_fold_map
 
     # try prim fold map, else fallback to StructureMatcher?
+    # TODO see new implementation in get_equiv_frac_coords_in_primitive
     fold_map = _get_supercell_to_prim_fold_map(bulk_supercell, primitive_structure, symprec=symprec)
     if fold_map is not None:
         M, translation = fold_map
@@ -1658,6 +1671,7 @@ def _get_complex_orbit_in_prim(
     quotient_ops: list[SymmOp] | None = None,
     symprec: float = 0.01,
     dist_tol_factor: float = 1.0,
+    labels: Sequence[Hashable] | None = None,
 ) -> tuple[list[list[PeriodicSite]], str]:
     """
     Get the orbit and point group of a defect complex, given a primitive
@@ -1668,7 +1682,7 @@ def _get_complex_orbit_in_prim(
     configuration and constituent ordering), such that ``orbit[0]`` is a consistent
     representative of the orbit, returned if any element of the orbit were input.
     The point group (Schoenflies symbol) is that of the complex (i.e. of its
-    stabiliser, computed internally for the canonical representative).
+    stabiliser).
 
     Args:
         point_defects (list[PeriodicSite]):
@@ -1686,6 +1700,13 @@ def _get_complex_orbit_in_prim(
         dist_tol_factor (float):
             Factor by which symprec is multiplied to give the distance
             tolerance for clustering equal complexes. (Default: 1.0)
+        labels (Sequence[Hashable] | None):
+            Labels by which constituents are matched when clustering equal
+            complexes. If ``None`` (default), the constituent species are
+            used. Constituents are only ever matched to those sharing a
+            label, so labelling a constituent distinctly (e.g. the head of a
+            defect chain) restricts the orbit to configurations in which that
+            constituent also corresponds.
 
     Returns:
         tuple[list[list[PeriodicSite]], str]:
@@ -1695,6 +1716,73 @@ def _get_complex_orbit_in_prim(
             representative, and all elements given in the unit primitive cell
             (i.e. with complex centroids translated to lie within the unit
             cell).
+    """
+    point_labels = list(labels) if labels is not None else [site.species_string for site in point_defects]
+    orbit_fcs, point_group = _get_complex_orbit_fcs_in_prim(
+        np.array([site.frac_coords for site in point_defects]),
+        point_labels,
+        primitive,
+        quotient_ops=quotient_ops,
+        symprec=symprec,
+        dist_tol_factor=dist_tol_factor,
+    )
+
+    # recreate PeriodicSite objects, keeping the species/properties of the input point defects
+    orbit = []
+    for member_fcs in orbit_fcs:
+        member = []
+        for site, frac_coords in zip(point_defects, member_fcs, strict=True):
+            new_site = deepcopy(site)
+            new_site.frac_coords = frac_coords
+            member.append(new_site)
+        orbit.append(member)
+
+    # sort the orbit deterministically, so orbit[0] is the representative element
+    orbit, _sort_index = _sort_complex_orbit(orbit, labels=point_labels)
+
+    return orbit, point_group
+
+
+def _get_complex_orbit_fcs_in_prim(
+    point_fcs: np.ndarray,
+    labels: Sequence[Hashable],
+    primitive: Structure,
+    quotient_ops: list[SymmOp] | None = None,
+    symprec: float = 0.01,
+    dist_tol_factor: float = 1.0,
+) -> tuple[np.ndarray, str]:
+    """
+    Get the orbit and point group of a defect complex, given its constituent
+    fractional coordinates and a primitive structure; the coordinate-only core
+    of ``_get_complex_orbit_in_prim`` (see there for details).
+
+    Args:
+        point_fcs (np.ndarray):
+            ``(n_constituents, 3)`` fractional coordinates of the constituent
+            point defects, in the primitive frame.
+        labels (Sequence[Hashable]):
+            Labels by which constituents are matched when clustering equal
+            complexes; see ``_get_complex_orbit_in_prim``.
+        primitive (|Structure|):
+            Primitive host structure.
+        quotient_ops (list[SymmOp] | None):
+            Space group symmetry operations, in fractional coordinates,
+            to test. If ``None``, determined from ``primitive``.
+        symprec (float):
+            Symmetry precision; see ``_get_complex_orbit_in_prim``.
+            (Default: 0.01)
+        dist_tol_factor (float):
+            Factor by which symprec is multiplied to give the distance
+            tolerance for clustering equal complexes. (Default: 1.0)
+
+    Returns:
+        tuple[np.ndarray, str]:
+            The ``(n_orbit, n_constituents, 3)`` fractional coordinates of the
+            orbit, with the constituent ordering of the input maintained, and
+            the Schoenflies point group symbol. The orbit members are in
+            arbitrary order; ``_get_complex_orbit_in_prim`` sorts them
+            deterministically (which callers taking a canonical representative
+            require, but which is unnecessary when the whole orbit is used).
     """
     # check that input structure is primitive
     if len(get_primitive_structure(primitive, symprec=symprec)) != len(primitive):
@@ -1712,10 +1800,11 @@ def _get_complex_orbit_in_prim(
     dist_tol = dist_tol_factor * symprec
     lattice = primitive.lattice
 
-    # get labels and fractional coordinates, and centre the complex (centroid to unit primitive)
-    point_labels = [site.species_string for site in point_defects]
-    point_fcs = np.asarray([site.frac_coords for site in point_defects])
-    point_fcs -= np.floor(np.mean(point_fcs, axis=0))
+    # centre the complex (centroid to unit primitive); not in-place, as ``point_fcs`` is the
+    # caller's array (e.g. shared with the candidate complexes in ``_reduce_equivalent_complexes``)
+    point_labels = list(labels)
+    point_fcs = np.asarray(point_fcs, dtype=float)
+    point_fcs = point_fcs - np.floor(np.mean(point_fcs, axis=0))
 
     # apply operations
     rotations = np.array([op.rotation_matrix for op in quotient_ops])  # (n_ops, 3, 3)
@@ -1726,7 +1815,8 @@ def _get_complex_orbit_in_prim(
     # centre all complexes to unit primitive
     transformed_fcs -= np.floor(np.mean(transformed_fcs, axis=1, keepdims=True))
 
-    # add the original complex back in for ease of identifying stabiliser
+    # add the original complex back in for ease of identifying stabiliser if quotient_ops
+    # don't necessarily come identity first
     all_fcs = np.concatenate([point_fcs[None, :, :], transformed_fcs])  # (n_ops + 1, n_sites, 3)
 
     # cluster
@@ -1734,48 +1824,29 @@ def _get_complex_orbit_in_prim(
         [point_labels] * len(all_fcs), all_fcs, lattice, dist_tol=dist_tol
     )
 
-    # get orbit representatives (one configuration per cluster)
-    fcs_orbit = [all_fcs[idx[0]] for idx in cluster_indices]
+    # clusters come by first appearance so first cluster corresponds to original complex
+    # and stabiliser is just corresponding ops
+    stabiliser = [quotient_ops[i - 1] for i in cluster_indices[0] if i > 0]
 
-    # recreate PeriodicSite objects
-    orbit = []
-    for complex_fcs in fcs_orbit:
-        new_sites = []
-        for site, fcs in zip(point_defects, complex_fcs, strict=True):
-            new_site = deepcopy(site)
-            new_site.frac_coords = fcs
-            new_sites.append(new_site)
-        orbit.append(new_sites)
-
-    # sort the orbit deterministically, so orbit[0] is the representative element
-    orbit, _sort_index = _sort_complex_orbit(orbit)
-
-    # TODO just pick the right coset instead of redoing this
-    # get the stabiliser of the canonical representative complex (orbit[0]), used for the point group
-    # and the orbit-stabiliser sanity check below:
-    target_fcs = np.asarray([site.frac_coords for site in orbit[0]])
-    target_transformed_fcs = np.einsum("oij,nj->oni", rotations, target_fcs) + translations[:, None, :]
-    target_transformed_fcs -= np.floor(np.mean(target_transformed_fcs, axis=1, keepdims=True))
-    stabiliser = [
-        op
-        for op, op_fcs in zip(quotient_ops, target_transformed_fcs, strict=True)
-        if _complex_frac_coords_dist(point_labels, target_fcs, point_labels, op_fcs, lattice) <= dist_tol
-    ]
+    # TODO check group closure?
 
     # check group theory results (orbit-stabiliser theorem):
-    if len(orbit) * len(stabiliser) != len(quotient_ops):
+    if len(cluster_indices) * len(stabiliser) != len(quotient_ops):
         warnings.warn(
-            f"Orbit size ({len(orbit)}) x stabiliser size ({len(stabiliser)}) does not equal the number "
-            f"of symmetry operations ({len(quotient_ops)}). Check the symmetry tolerances used "
-            f"(symprec = {symprec}, dist_tol = {dist_tol})."
+            f"Orbit size ({len(cluster_indices)}) x stabiliser size ({len(stabiliser)}) does not equal "
+            f"the number of symmetry operations ({len(quotient_ops)}). Check the symmetry tolerances "
+            f"used (symprec = {symprec}, dist_tol = {dist_tol})."
         )
+
+    # get orbit representatives (one configuration per cluster)
+    fcs_orbit = np.array([all_fcs[idx[0]] for idx in cluster_indices])
 
     # TODO align with new local_point_symmetry methods - eg schoenflies from cartesian ops etc
     pg_ops = [np.rint(op.rotation_matrix).astype(int) for op in stabiliser]
     if (pointgroup := get_pointgroup(pg_ops)) is None:
         raise RuntimeError("Could not determine the point group of the defect complex stabiliser.")
     hermann_symbol, _number, _transform = pointgroup
-    return orbit, schoenflies_from_hermann(hermann_symbol.strip())
+    return fcs_orbit, schoenflies_from_hermann(hermann_symbol.strip())
 
 
 def get_all_equiv_complexes(
@@ -1861,6 +1932,7 @@ def get_all_equiv_complexes(
 def _sort_complex_orbit(
     orbit: list[list[PeriodicSite]],
     prec: int = 5,
+    labels: Sequence[Hashable] | None = None,
 ) -> tuple[list[list[PeriodicSite]], list[int]]:
     r"""
     Deterministically sort the members of a defect complex orbit (used within
@@ -1881,28 +1953,554 @@ def _sort_complex_orbit(
             Number of decimal places to which fractional coordinates are
             rounded for sort keys.
             (Default: 5)
+        labels (Sequence[Hashable] | None):
+            Labels of the constituent point defects, used in the sort keys.
+            If ``None`` (default), the constituent species are used.
 
     Returns:
         tuple[list[list[PeriodicSite]], list[int]]:
             The sorted orbit, and the indices which sort the input orbit
             members, as ``(sorted_orbit, sort_index)``.
     """
-    labels = [site.species_string for site in orbit[0]]
-
-    # define key for sorting complexes
-    # firstly sort by centroid, then by constituent point defects
-    # (equal complexes should have the same key)
-    def _member_key(member: list[PeriodicSite]) -> tuple:
-        member_fcs = np.asarray([site.frac_coords for site in member])
-        centroid = np.mean(member_fcs, axis=0)
-        rel_fcs = np.round(member_fcs - centroid, prec)
-        return (
-            _frac_coords_sort_func(centroid),
-            sorted(zip(labels, map(tuple, rel_fcs), strict=True)),
-        )
+    labels = labels if labels is not None else [site.species_string for site in orbit[0]]
 
     # sort complexes by key
-    sort_index = sorted(range(len(orbit)), key=lambda k: _member_key(orbit[k]))
+    sort_index = sorted(
+        range(len(orbit)),
+        key=lambda k: _complex_key(labels, [site.frac_coords for site in orbit[k]], prec=prec),
+    )
     sorted_orbit = [orbit[k] for k in sort_index]
 
     return sorted_orbit, sort_index
+
+
+def _complex_key(labels: Sequence[Hashable], frac_coords: Sequence | np.ndarray, prec: int = 5) -> tuple:
+    """
+    Return deterministic hashable key for a defect complex configuration, based
+    on labels and frac coords. Matches complex up to integer lattice
+    translation but no other symmetry operations.
+
+    Args:
+        labels (Sequence[Hashable]):
+            Labels (e.g. species strings) of the constituent point defects.
+        frac_coords (Sequence | np.ndarray):
+            ``(n, 3)`` array of (unwrapped) fractional coordinates of the
+            constituent point defects.
+        prec (int):
+            Number of decimal places to which the centroid-relative
+            fractional coordinates are rounded.
+            (Default: 5)
+
+    Returns:
+        tuple: Hashable key for the defect complex configuration.
+    """
+    # TODO check about using _frac_coords_sort_func here with fixed precision
+    frac_coords = np.asarray(frac_coords)
+    centroid = np.mean(frac_coords, axis=0)
+    rel_fcs = np.round(frac_coords - centroid, prec)
+    return (
+        _frac_coords_sort_func(centroid - np.floor(centroid)),
+        tuple(sorted(zip(labels, map(tuple, rel_fcs), strict=True))),
+    )
+
+
+def _reduce_equivalent_complexes(
+    complexes: Iterable[tuple[Sequence[Hashable], np.ndarray]],
+    primitive: Structure,
+    quotient_ops: list[SymmOp] | None = None,
+    symprec: float = 0.01,
+    dist_tol_factor: float = 1.0,
+) -> list[tuple[int, np.ndarray, str]]:
+    """
+    Reduce a set of candidate defect complexes to only symmetry inequivalent
+    sets of orbits.
+
+    Args:
+        complexes (Iterable[tuple[Sequence[Hashable], np.ndarray]]):
+            Candidate complexes, as ``(labels, frac_coords)`` tuples.
+        primitive (|Structure|):
+            Primitive host structure.
+        quotient_ops (list[SymmOp] | None):
+            Space group symmetry operations, in fractional coordinates. If
+            ``None``, these are redetermined for each generated orbit, so
+            can be provided here. (Default: None)
+        symprec (float):
+            Symmetry precision for the space group operations. (Default: 0.01)
+        dist_tol_factor (float):
+            Factor by which ``symprec`` is multiplied to give the distance
+            tolerance for matching equal complexes. (Default: 1.0)
+
+    Returns:
+        list[tuple[int, np.ndarray, str]]:
+            For each symmetry-inequivalent complex: the index of the first
+            candidate which generated it; its orbit ``(n_orbit,
+            n_constituents, 3)`` array of fractional coordinates, with
+            constituent ordering matching the input; the Schoenflies
+            point group symbol.
+    """
+    lattice = primitive.lattice
+    dist_tol = dist_tol_factor * symprec
+    seen: dict[tuple, tuple[Sequence[Hashable], np.ndarray]] = {}  # {key: labels and frac coords}
+    inequivalent = []
+
+    for idx, (labels, complex_fcs) in enumerate(complexes):
+        frac_coords = np.asarray(complex_fcs)  # array needed for the label masking below
+        # check with _complex_frac_coords_dist explicitly - we assume _complex_key
+        # with constituent fcs at prec=5 and centroid at prec=3-4 is more discriminating
+        # (with reasonable cells/dist_tol)
+        prev = seen.get(_complex_key(labels, frac_coords))  # ``labels`` stored too, as a key match
+        if (  # only implies a matching label multiset, not a matching constituent ordering
+            prev is not None and _complex_frac_coords_dist(labels, frac_coords, *prev, lattice) <= dist_tol
+        ):
+            continue  # already seen
+
+        orbit_fcs, point_group = _get_complex_orbit_fcs_in_prim(  # unsorted; sorted in
+            frac_coords,  # ``_complex_from_orbit_coords`` when the complex is created
+            labels,
+            primitive,
+            quotient_ops=quotient_ops,
+            symprec=symprec,
+            dist_tol_factor=dist_tol_factor,
+        )
+        for member_fcs in orbit_fcs:  # record the whole orbit as seen
+            seen[_complex_key(labels, member_fcs)] = (labels, member_fcs)
+        inequivalent.append((idx, orbit_fcs, point_group))
+
+    return inequivalent
+
+
+def get_complex_chains(
+    defects: dict[str, Defect],
+    chain: Sequence[Iterable[str]],
+    max_separation: float = 2.5,
+    min_separation: float = 0.0,
+    symprec: float = 0.01,
+    dist_tol_factor: float = 1.0,
+) -> list[DefectComplex]:
+    r"""
+    Generate a set of symmetry-inequivalent defect complexes as ordered chains
+    of point defects. The set of possible point defects at each position in the
+    chain can be specified, as well as the maximum and minimum separation
+    between consecutive point defects in the chain.
+
+    ``chain`` sets both the length of the chains and the point defects allowed
+    at each position along them, so e.g. ``[["v_Cd"], ["Cd_i"], ["v_Cd"]]``
+    gives split vacancies (vacancy-interstitial-vacancy complexes), or
+    ``[["v_Cd", "v_Te"], ["v_Cd", "v_Te"]]`` gives all possible divacancies.
+
+    For an alternative method of defect complex generation, see
+    ``get_complex_clusters``.
+
+    Args:
+        defects (dict[str, Defect]):
+            The point defects available as chain constituents, as
+            ``{defect name: Defect}`` (sharing a common primitive host
+            structure), and against which the names in ``chain`` are matched.
+        chain (Sequence[Iterable[str]]):
+            The names of the point defects allowed at each position along
+            the chain, as one iterable per position: this sets both the
+            chain length and the allowed constituents.
+        max_separation (float):
+            Maximum distance (in Å) between consecutive constituent point
+            defects in a chain. (Default: 2.5)
+        min_separation (float):
+            Minimum distance (in Å) between consecutive constituent point
+            defects in a chain. (Default: 0.0)
+        symprec (float):
+            Symmetry precision for matching symmetry-equivalent chains.
+            (Default: 0.01)
+        dist_tol_factor (float):
+            Factor by which ``symprec`` is multiplied to give the distance
+            tolerance for matching equal complexes. (Default: 1.0)
+
+    Returns:
+        list[DefectComplex]:
+            The list of symmetry-inequivalent defect complexes.
+    """
+    # TODO worth adding per link max dist? trivial along with min_separation check
+    # also could make min_separation check over all previous constituents ie can't fold back?
+
+    chain = [list(position) for position in chain]
+    names = list(dict.fromkeys(name for position in chain for name in position))  # used defects only
+    pool = [defects[name] for name in names]
+
+    # list[list[int]] ie list of defect indices for each position in chain
+    positions = [[names.index(name) for name in position] for position in chain]
+    primitive = pool[0].structure
+
+    frac_coords, site_defects, site_neighbours = _get_candidate_site_graph(
+        pool, max_separation, dist_tol=symprec * dist_tol_factor
+    )
+    sga, symprec = get_sga_and_symprec(primitive, symprec)
+    quotient_ops = sga.get_symmetry_operations()
+    seed_sites = {
+        defect: index for index, defects_here in enumerate(site_defects) for defect in defects_here
+    }  # {int: int}, only one site (ie index) kept per defect
+
+    # each partial chain is (unwrapped) constituent frac coords, constituent point
+    # defect indices, and site index and image of each constituent:
+    partials = [
+        (frac_coords[[seed_sites[defect]]], [defect], [seed_sites[defect]], [np.zeros(3, int)])
+        for defect in positions[0]
+    ]
+
+    # loop over position in chain
+    for position, position_defects in enumerate(positions[1:], start=1):
+        final = position == len(positions) - 1
+        extended = []
+
+        # loop over partial chains of length position
+        for coords, chain_defects, sites, images in partials:
+            # loop over neighbours of head of chain
+            for site, rel_image, dist in zip(*site_neighbours[sites[-1]], strict=True):
+                image = images[-1] + rel_image  # neighbour images are relative to the head
+                if dist < min_separation or any(  # too close or already in chain
+                    s == site and np.array_equal(i, image) for s, i in zip(sites, images, strict=True)
+                ):
+                    continue
+
+                for defect in position_defects:
+                    if defect not in site_defects[site]:
+                        continue
+                    new_coords = np.vstack([coords, frac_coords[site] + image])
+                    extended.append(
+                        (new_coords, [*chain_defects, defect], [*sites, site], [*images, image])
+                    )
+
+        # generate candidate set for reduction: note the head of the chain is labelled
+        # so we don't lose it by reduction to an otherwise symmetry equivalent chain
+        candidates = [
+            ([*chain_defects[:-1], chain_defects[-1] + len(pool) * (not final)], coords)
+            for coords, chain_defects, _sites, _images in extended
+        ]
+
+        # reduce to symmetry inequivalent chains
+        inequiv_parts = _reduce_equivalent_complexes(
+            candidates, primitive, quotient_ops, symprec=symprec, dist_tol_factor=dist_tol_factor
+        )
+        if final:
+            # build the DefectComplex objects
+            return [
+                _complex_from_orbit_coords([pool[i] for i in extended[idx][1]], orbit, pg)
+                for idx, orbit, pg in inequiv_parts
+            ]
+        partials = [extended[idx] for idx, _orbit, _pg in inequiv_parts]
+
+    return []  # chain length 1 no complexes...? or should return point defects anyway
+
+
+def get_complex_clusters(
+    defects: Sequence[Defect],
+    size: int | tuple[int, int] = 2,
+    max_diameter: float = 3.0,
+    min_separation: float = 0.0,
+    allow_repeats: bool = True,
+    symprec: float = 0.01,
+    dist_tol_factor: float = 1.0,
+) -> list[DefectComplex]:
+    r"""
+    Generate a set of symmetry-inequivalent defect complexes as unordered
+    clusters of point defects. The set of possible point defects, the maximum
+    and minimum size of the cluster, and the maximum diameter of the complex
+    can be specified.
+
+    Constituents are drawn from ``defects`` in any combination, so e.g.
+    ``[v_Cd, v_Te]`` with ``size = 2`` gives all divacancies, and with
+    ``size = (2, 3)`` all di- and tri-vacancies. With ``allow_repeats = False``,
+    complexes with an exact composition can be specified, e.g.
+    ``[v_Cd, v_Cd, Cd_i, Cd_Te]`` with ``size = 4`` will only give clusters
+    with this exact composition of point defects.
+
+    For an alternative method of defect complex generation, see
+    ``get_complex_clusters``.
+
+    Args:
+        defects (Sequence[Defect]):
+            The point defects available as cluster constituents (sharing a
+            common primitive host structure). A point defect may be listed
+            more than once, giving the number of times it can appear in a
+            cluster when ``allow_repeats`` is ``False``.
+        size (int | tuple[int, int]):
+            Number of constituent point defects in the generated clusters,
+            or a ``(min, max)`` range. (Default: 2)
+        max_diameter (float):
+            Maximum distance (in Å) between any two constituent point
+            defects in a cluster. (Default: 3.0)
+        min_separation (float):
+            Minimum distance (in Å) between `any` two constituent point
+            defects in a cluster, e.g. to scan separation shells by
+            excluding clusters already generated with a smaller
+            ``max_diameter``. (Default: 0.0)
+        allow_repeats (bool):
+            Whether a point defect can appear in a cluster more times than
+            it is listed in ``defects`` (e.g. ``v_Cd + v_Cd`` from a singly-
+            listed ``v_Cd``). Distinct sites are required either way, so a
+            repeated point defect must occupy a different site (or periodic
+            image) of its orbit. (Default: True)
+        symprec (float):
+            Symmetry precision for matching symmetry-equivalent clusters.
+            (Default: 0.01)
+        dist_tol_factor (float):
+            Factor by which ``symprec`` is multiplied to give the distance
+            tolerance for matching equal complexes. (Default: 1.0)
+
+    Returns:
+        list[DefectComplex]:
+            The list of symmetry-inequivalent defect complexes.
+    """
+    min_size, max_size = (size, size) if isinstance(size, int) else size
+    pool = list(dict.fromkeys(defects))
+    indices = {defect: index for index, defect in enumerate(pool)}
+
+    # count available number of each defect: because we allow for eg [v_Cd,v_Cd,Cd_i],
+    # allow_repeats=False,size=3 to give v_Cd+v_cd+Cd_i type complexes only
+    counts = Counter(indices[defect] for defect in defects)
+    primitive = pool[0].structure
+
+    frac_coords, site_defects, site_neighbours = _get_candidate_site_graph(
+        pool, max_diameter, dist_tol=symprec * dist_tol_factor
+    )
+    sga, symprec = get_sga_and_symprec(primitive, symprec)
+    quotient_ops = sga.get_symmetry_operations()
+    seed_sites = {
+        defect: index for index, defects_here in enumerate(site_defects) for defect in defects_here
+    }  # {int: int}, only one site (ie index) kept per defect
+
+    # each partial chain is (unwrapped) constituent frac coords, constituent point
+    # defect indices, and site index and image of each constituent:
+    partials = [
+        (frac_coords[[seed_sites[defect]]], [defect], [seed_sites[defect]], [np.zeros(3, int)])
+        for defect in range(len(pool))
+    ]
+    complexes: list[DefectComplex] = []
+
+    for cluster_size in range(2, max_size + 1):
+        extended = []
+
+        for coords, cluster_defects, sites, images in partials:
+            # get neighbours of any constituent
+            for site, rel_image, _dist in zip(*site_neighbours[sites[-1]], strict=True):
+                image = images[-1] + rel_image  # neighbour images are relative to the last-added
+                if any(s == site and np.array_equal(i, image) for s, i in zip(sites, images, strict=True)):
+                    continue  # already in the cluster
+
+                # check satisfies max_diameter and min_separation
+                new_fcs = frac_coords[site] + image
+                dists = np.linalg.norm((coords - new_fcs) @ primitive.lattice.matrix, axis=1)
+                if dists.max() > max_diameter or dists.min() < min_separation:
+                    continue
+
+                new_coords = np.vstack([coords, new_fcs])
+                for defect in site_defects[site]:
+                    if not allow_repeats and cluster_defects.count(defect) >= counts[defect]:
+                        continue
+
+                    extended.append(
+                        (new_coords, [*cluster_defects, defect], [*sites, site], [*images, image])
+                    )
+
+        # reduce symmetry equivalent complexes
+        inequiv_parts = _reduce_equivalent_complexes(
+            [(cluster_defects, coords) for coords, cluster_defects, _sites, _images in extended],
+            primitive,
+            quotient_ops,
+            symprec=symprec,
+            dist_tol_factor=dist_tol_factor,
+        )
+        if cluster_size >= min_size:
+            complexes += [
+                _complex_from_orbit_coords([pool[i] for i in extended[idx][1]], orbit, pg)
+                for idx, orbit, pg in inequiv_parts
+            ]
+        partials = [extended[idx] for idx, _orbit, _pg in inequiv_parts]
+
+    return complexes
+
+
+def _complex_from_orbit_coords(
+    defects: Sequence[Defect],
+    orbit: np.ndarray,
+    point_group: str | None = None,
+    **doped_kwargs,
+) -> DefectComplex:
+    """
+    Create a |DefectComplex| from its constituent point defects and the full
+    orbit coordinates of its symmetry-equivalent configurations. This generates
+    a |DefectComplex| with a standard, deterministic ordering of its defects
+    and orbit, matching the ordering of an object generated from parsing.
+
+    Args:
+        defects (Sequence[Defect]):
+            Constituent point defects, ordered as the constituents of
+            ``orbit``. Only their species and defect types are used; their
+            sites are taken from ``orbit``.
+        orbit (np.ndarray):
+            ``(n_orbit, n_constituents, 3)`` array of fractional coordinates
+            of the symmetry-equivalent configurations of the complex. The
+            members (axis 0) may be given in any order, but their
+            constituents (axis 1) must match the order of ``defects``.
+        point_group (str):
+            Schoenflies point group symbol of the complex.
+        **doped_kwargs:
+            Additional keyword arguments for the |DefectComplex| initialisation.
+
+    Returns:
+        DefectComplex: The defect complex.
+    """
+    # sort before constructing Defect objects such that Defect objects correspond to
+    # equivalent_complexes[0]
+    names = [defect.name for defect in defects]
+    orbit = orbit[sorted(range(len(orbit)), key=lambda idx: _complex_key(names, orbit[idx]))]
+
+    # Defect object construction
+    lattice = defects[0].structure.lattice
+    constituents = []
+    for defect, frac_coords in zip(defects, orbit[0], strict=True):
+        constituent = deepcopy(defect)
+        constituent.site = PeriodicSite(defect.site.species, frac_coords, lattice)
+        constituents.append(constituent)
+
+    # orbit PeriodicSite construction
+    sites_orbit = [
+        [
+            PeriodicSite(constituent.site.species, frac_coords, lattice)
+            for constituent, frac_coords in zip(constituents, member, strict=True)
+        ]
+        for member in orbit
+    ]
+    # construct DefectComplex
+    complex_defect, _sort_index = _sorted_defect_complex(
+        constituents, sites_orbit, point_group=point_group, **doped_kwargs
+    )
+    return complex_defect
+
+
+def _sorted_defect_complex(
+    defects: list[Defect],
+    orbit: Sequence[Sequence[PeriodicSite]],
+    point_group: str | None = None,
+    **doped_kwargs,
+) -> tuple[DefectComplex, list[int]]:
+    """
+    Create a |DefectComplex| from its constituent point defects and the orbit
+    of its symmetry-equivalent configurations, with both the constituent
+    defects and the orbit sorted to a standard, deterministic order. The same
+    |DefectComplex| should be obtained for any permutation of the orbit and
+    defects, other than the stored |Defect| objects from input, whose sites are
+    left unchanged (up to an integer lattice translation to centre the
+    centroid), i.e. their sites are the input Defect.site, and don't
+    necessarily correspond to equivalent_complexes[0].
+
+    Args:
+        defects (list[Defect]):
+            Constituent point defects of the complex, with their sites set,
+            in any order.
+        orbit (Sequence[Sequence[|PeriodicSite|]]):
+            The symmetry-equivalent configurations of the complex, in any
+            order, with the constituents of each ordered as ``defects``.
+        point_group (str | None):
+            Schoenflies point group symbol of the complex.
+        **doped_kwargs:
+            Additional keyword arguments for the |DefectComplex| initialisation.
+
+    Returns:
+        tuple[DefectComplex, list[int]]:
+            The defect complex, and the indices which sort the input
+            constituents (for reordering any accompanying per-constituent
+            information).
+    """
+    # TODO currently the constituent ordering within each orbit member is only deterministic up to
+    # permutations of constituents whose defect sort keys collide. worth checking if this could ever
+    # be problematic - in which case a full 2D sort index would be needed over constituents within
+    # each orbit element. but then note this could mess up that each orbit element is an exact per
+    # constituent image under a certain symmetry operation?
+    from doped.generation import _defect_sort_key, _get_element_list  # avoids circular import
+
+    # sort point defects deterministically (matching ``_sort_defects``, then by prim
+    # site coords instead of conv cell for same name)
+    element_list = _get_element_list(defects)
+    sort_index = sorted(
+        range(len(defects)),
+        key=lambda i: (
+            _defect_sort_key(defects[i], element_list),
+            tuple(np.round(defects[i].site.frac_coords, 5)),
+        ),
+    )
+    sorted_defects = [defects[i] for i in sort_index]
+    sorted_orbit = [[member[i] for i in sort_index] for member in orbit]
+
+    # then sort the orbit members: _complex_key is invariant to the constituent ordering, so
+    # this is independent of both input orderings (may already be sorted, e.g. as currently the
+    # case in both generation and analysis, but keeps this ordering deterministic)
+    names = [defect.name for defect in sorted_defects]
+    sorted_orbit.sort(key=lambda member: _complex_key(names, [site.frac_coords for site in member]))
+
+    return (
+        DefectComplex(
+            sorted_defects,
+            equivalent_complexes=sorted_orbit,
+            point_group=point_group,
+            **doped_kwargs,
+        ),
+        sort_index,
+    )
+
+
+def _get_candidate_site_graph(
+    defects: Sequence[Defect], max_dist: float, dist_tol: float = 0.01
+) -> tuple[np.ndarray, list[list[int]], list[tuple[np.ndarray, np.ndarray, np.ndarray]]]:
+    """
+    For a set of defects in a given structure, generate the set of possible
+    sites, the defects which can occupy each sites, and the other defect sites
+    within a certain distance of each site. Coincident sites are merged, and
+    all neighbours are included (i.e. all distinct periodic images, excluding
+    the site itself, but including its own periodic images).
+
+    Args:
+        defects (Sequence[Defect]):
+            Point defects to take the candidate sites of, sharing a common
+            (primitive) host structure.
+        max_dist (float):
+            Maximum neighbour distance (in Å).
+        dist_tol (float):
+            Distance tolerance (in Å) just used for matching sites. (Default: 0.01)
+
+    Returns:
+        tuple[np.ndarray, list[list[int]], list[tuple[np.ndarray, ...]]]:
+            The ``(n_sites, 3)`` fractional coordinates of the candidate
+            defect sites; the indices in ``defects`` of the point defects which
+            can occupy each site; the neighbours of each as
+            ``(index, image, distance)`` arrays ordered by increasing distance.
+    """
+    # get all equivalent defect sites
+    lattice = defects[0].structure.lattice
+    for defect in defects:
+        if not defect.equivalent_sites:
+            defect.get_multiplicity()  # populate equivalent_sites
+    site_defects = [index for index, defect in enumerate(defects) for _ in defect.equivalent_sites]
+    frac_coords = np.array([site.frac_coords for defect in defects for site in defect.equivalent_sites])
+
+    # group coincident sites, get defects corresponding to each site
+    clusters = cluster_coords(frac_coords, lattice, dist_tol=dist_tol)
+    sites_and_defects = [
+        (frac_coords[idxs[0]], [site_defects[i] for i in idxs])
+        for idxs in (np.where(clusters == cluster)[0] for cluster in set(clusters))
+    ]
+    sites_and_defects.sort(key=lambda site_and_defects: _frac_coords_sort_func(site_and_defects[0]))
+    site_fcs, defects_per_site = (list(i) for i in zip(*sites_and_defects, strict=True))
+
+    # construct structure for convenient get_neighbor_list method
+    sites_struct = Structure(lattice, ["X"] * len(site_fcs), site_fcs)
+    centres, neighbours, images, dists = sites_struct.get_neighbor_list(r=max_dist, exclude_self=True)
+
+    # sort with nearest neighbours first
+    order = np.argsort(dists)
+    centres, neighbours, dists = centres[order], neighbours[order], dists[order]
+    images = np.rint(images[order]).astype(int)  # integer cells
+    site_neighbours = [
+        (neighbours[matches], images[matches], dists[matches])
+        for matches in (centres == index for index in range(len(site_fcs)))
+    ]
+
+    # TODO legibility
+    return np.array(site_fcs), defects_per_site, site_neighbours
