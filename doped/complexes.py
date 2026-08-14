@@ -1671,12 +1671,14 @@ def _get_complex_orbit_in_prim(
     quotient_ops: list[SymmOp] | None = None,
     symprec: float = 0.01,
     dist_tol_factor: float = 1.0,
-    labels: Sequence[Hashable] | None = None,
 ) -> tuple[list[list[PeriodicSite]], str]:
     """
     Get the orbit and point group of a defect complex, given a primitive
     structure. The order of sites within each complex is maintained from input
     to output.
+
+    Constituents are matched by species when clustering equal complexes; see
+    ``_get_complex_orbit_fcs_in_prim`` to match by arbitrary labels instead.
 
     The orbit is deterministically sorted (independent of the input
     configuration and constituent ordering), such that ``orbit[0]`` is a consistent
@@ -1700,24 +1702,17 @@ def _get_complex_orbit_in_prim(
         dist_tol_factor (float):
             Factor by which symprec is multiplied to give the distance
             tolerance for clustering equal complexes. (Default: 1.0)
-        labels (Sequence[Hashable] | None):
-            Labels by which constituents are matched when clustering equal
-            complexes. If ``None`` (default), the constituent species are
-            used. Constituents are only ever matched to those sharing a
-            label, so labelling a constituent distinctly (e.g. the head of a
-            defect chain) restricts the orbit to configurations in which that
-            constituent also corresponds.
 
     Returns:
         tuple[list[list[PeriodicSite]], str]:
             The orbit of the complex in the crystal (per primitive lattice
             cell) and its Schoenflies point group symbol. The orbit is
-            deterministically sorted, with ``orbit[0]`` the canonical
-            representative, and all elements given in the unit primitive cell
+            deterministically sorted, with ``orbit[0]`` the representative
+            complex, and all elements given in the unit primitive cell
             (i.e. with complex centroids translated to lie within the unit
             cell).
     """
-    point_labels = list(labels) if labels is not None else [site.species_string for site in point_defects]
+    point_labels = [site.species_string for site in point_defects]
     orbit_fcs, point_group = _get_complex_orbit_fcs_in_prim(
         np.array([site.frac_coords for site in point_defects]),
         point_labels,
@@ -1727,7 +1722,7 @@ def _get_complex_orbit_in_prim(
         dist_tol_factor=dist_tol_factor,
     )
 
-    # recreate PeriodicSite objects, keeping the species/properties of the input point defects
+    # recreate PeriodicSite objects
     orbit = []
     for member_fcs in orbit_fcs:
         member = []
@@ -1754,7 +1749,9 @@ def _get_complex_orbit_fcs_in_prim(
     """
     Get the orbit and point group of a defect complex, given its constituent
     fractional coordinates and a primitive structure; the coordinate-only core
-    of ``_get_complex_orbit_in_prim`` (see there for details).
+    of ``_get_complex_orbit_in_prim`` (see there for details). Note output is
+    not sorted as labels may be arbitrary: use ``_get_complex_orbit_in_prim`` if a
+    deterministic order is required.
 
     Args:
         point_fcs (np.ndarray):
@@ -1762,7 +1759,7 @@ def _get_complex_orbit_fcs_in_prim(
             point defects, in the primitive frame.
         labels (Sequence[Hashable]):
             Labels by which constituents are matched when clustering equal
-            complexes; see ``_get_complex_orbit_in_prim``.
+            complexes.
         primitive (|Structure|):
             Primitive host structure.
         quotient_ops (list[SymmOp] | None):
@@ -1779,17 +1776,14 @@ def _get_complex_orbit_fcs_in_prim(
         tuple[np.ndarray, str]:
             The ``(n_orbit, n_constituents, 3)`` fractional coordinates of the
             orbit, with the constituent ordering of the input maintained, and
-            the Schoenflies point group symbol. The orbit members are in
-            arbitrary order; ``_get_complex_orbit_in_prim`` sorts them
-            deterministically (which callers taking a canonical representative
-            require, but which is unnecessary when the whole orbit is used).
+            the Schoenflies point group symbol.
     """
     # check that input structure is primitive
     if len(get_primitive_structure(primitive, symprec=symprec)) != len(primitive):
         # TODO better way to deal with this?
         raise ValueError(
             "``_get_complex_orbit_in_prim`` requires a primitive host structure, but the provided "
-            "structure is not primitive. Try get_all_equiv_complexes, or adjust symmetry tolerances."
+            "structure is not primitive. Try ``get_all_equiv_complexes``, or adjust symmetry tolerances."
         )
 
     # get space group if not provided

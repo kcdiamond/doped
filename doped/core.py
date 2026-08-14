@@ -2618,7 +2618,7 @@ class Defect(core.Defect):
             vacancy_sites=sc_site if isinstance(self, core.Vacancy) else None,
             interstitial_sites=sc_site if isinstance(self, core.Interstitial) else None,
             substitution_sites=sc_site if isinstance(self, core.Substitution) else None,
-        )  # TODO: Input parameters to be updated for defect complexes
+        )
 
         # remove oxidation states from supercell structure and sites:
         sc_defect_struct.remove_oxidation_states()
@@ -3220,7 +3220,9 @@ class DefectComplex(core.DefectComplex, Defect):
                 host ``structure``), with (unwrapped) sites defining the
                 complex geometry. Constituents should generally be consistent as
                 `standalone` point defect objects, except that ``site`` may lie
-                outside the unit cell.
+                outside the unit cell. Note that direct initialisation of
+                a |DefectComplex| will take these |Defect| instances directly,
+                instead of copying them.
             oxi_state (float, int or str):
                 The oxidation state of the defect complex. If not specified,
                 this is set to the sum of the constituent point defect
@@ -3393,7 +3395,8 @@ class DefectComplex(core.DefectComplex, Defect):
             )
 
         # TODO we actually don't do this for doped Defect
-        if self.equivalent_complexes:
+        # remove early return so input symprec is actually used...?
+        if self.equivalent_complexes and self.point_group:  # both are set by the orbit analysis below
             return len(self.equivalent_complexes)
 
         from doped.complexes import get_all_equiv_complexes
@@ -3411,6 +3414,7 @@ class DefectComplex(core.DefectComplex, Defect):
         )
         return len(self.equivalent_complexes)
 
+    # TODO like 100x slower than Defect.__eq__ look into this
     def __eq__(self, other) -> bool:
         """
         Determine whether two ``DefectComplex`` objects are equal.
@@ -3482,15 +3486,214 @@ class DefectComplex(core.DefectComplex, Defect):
         """
         return hash(self.name)
 
-    def get_supercell_structure(self, *args, **kwargs) -> Structure:
-        """
+    def get_supercell_structure(
+        self,
+        sc_mat: np.ndarray | None = None,
+        target_frac_coords: np.ndarray | list[float] | None = None,
+        return_sites: bool = False,
+        min_image_distance: float | None = None,
+        min_atoms: int = 50,
+        force_cubic: bool = False,
+        force_diagonal: bool = False,
+        ideal_threshold: float = 0.1,
+        min_length: float | None = None,  # as in Defect for compatibility
+        dummy_species: str | None = None,
+        min_span_factor: float = 1.5,
+    ) -> Structure | tuple[Structure, list[PeriodicSite]]:
+        r"""
         Generate the simulation supercell for the defect complex.
 
-        Not yet implemented for ``DefectComplex`` objects.
+        If ``sc_mat`` is ``None``, the supercell is generated using
+        ``get_ideal_complex_supercell_matrix``: an equivalent of the
+        ``doped`` algorithm used for point defects, but maximising the
+        complex minimum image distance (i.e. the minimum distance between
+        any constituent point defect and a constituent point defect of a
+        periodic image), which may vary between complexes.
+
+        If ``sc_mat`` is provided, the symmetry-equivalent complex will be
+        chosen that maximises the complex minimum image distance.
+
+        Warns if the complex minimum image distance is not appreciably larger
+        than the complex span (the largest separation between its
+        constituents), as the constituents are then as close (or closer) to
+        those of neighbouring complex images as they are to each other, so the
+        complex is not well-defined in this supercell.
+
+        Args:
+            sc_mat (np.ndarray | None):
+                Transformation matrix of ``self.structure`` to create the
+                supercell in which to place the complex. If ``None``,
+                automatically computed using
+                ``get_ideal_complex_supercell_matrix``.
+            target_frac_coords (np.ndarray | list[float] | None):
+                If set, the complex is translated to place its centroid at the
+                closest equivalent position to these fractional coordinates in
+                the supercell, while keeping the supercell fixed.
+            return_sites (bool):
+                If ``True``, returns a tuple of the defect supercell and the
+                constituent sites (ordered as ``self.defects``).
+                (Default: False)
+            min_image_distance (float | None):
+                Minimum complex minimum image distance (in Å) of the generated
+                supercell, if ``sc_mat`` is ``None``. If ``None`` (default),
+                ``max(10, 2 * span)`` is used.
+            min_atoms (int):
+                Minimum number of atoms in the generated supercell, if
+                ``sc_mat`` is ``None``. (Default: 50)
+            force_cubic (bool):
+                Whether to enforce the most cubic supercell of the chosen
+                size, if ``sc_mat`` is ``None``. (Default: False)
+            force_diagonal (bool):
+                If True, return a transformation with a diagonal
+                transformation matrix (if ``sc_mat`` is None).
+                (Default: False)
+            ideal_threshold (float):
+                Threshold for increasing supercell size (beyond that which
+                satisfies ``min_image_distance`` and ``min_atoms``) to achieve
+                an ideal supercell matrix, if ``sc_mat`` is ``None``.
+                (Default: 0.1)
+            min_length (float | None):
+                Alias for ``min_image_distance``, for compatibility.
+            dummy_species (str | None):
+                Dummy species with which to mark the complex centroid (for
+                visualising). If ``None`` (default), no dummy species is added.
+            min_span_factor (float):
+                Factor of the complex span below which the complex minimum
+                image distance triggers a warning. (Default: 1.5)
+
+        Returns:
+            |Structure| | tuple[|Structure|, list[|PeriodicSite|]]:
+                The defect supercell structure, and if ``return_sites`` is
+                ``True``, the constituent sites.
         """
-        raise NotImplementedError(
-            "Supercell structure generation for defect complexes is not yet implemented!"
+        from pymatgen.util.coord import lattice_points_in_supercell
+
+        from doped.utils.supercells import _get_complex_min_image_distance_from_matrix
+
+        # worth trying to get equivalent_complexes as orientation of complex
+        # in cell can make significant difference to min image distance
+        if not self.equivalent_complexes and sc_mat is not None:
+            with contextlib.suppress(Exception):
+                self.get_multiplicity()
+        orbit = self.equivalent_complexes or [[defect.site for defect in self.defects]]
+        all_cart_coords = [
+            self.structure.lattice.get_cartesian_coords([site.frac_coords for site in member])
+            for member in orbit
+        ]
+
+        if sc_mat is None:
+            from doped.generation import get_ideal_complex_supercell_matrix
+
+            if min_length is not None:
+                min_image_distance = min_length
+
+            # get sc_mat for arbitrary orbit member - all lattice orientations will be tested
+            sc_mat = get_ideal_complex_supercell_matrix(
+                self.structure,
+                all_cart_coords[0],
+                min_image_distance=min_image_distance,
+                min_atoms=min_atoms,
+                force_cubic=force_cubic,
+                force_diagonal=force_diagonal,
+                ideal_threshold=ideal_threshold,
+            )
+
+        sc_mat = np.asarray(sc_mat)
+        sc_structure = self.structure * sc_mat  # ``self.structure`` may be oxi-state-decorated
+
+        # we want to choose orbit element which maximises complex min image distance as
+        # primary criterion
+        min_image_dists = np.array(
+            [
+                _get_complex_min_image_distance_from_matrix(sc_structure.lattice.matrix, cart_coords)
+                for cart_coords in all_cart_coords
+            ]
         )
+        # transform to supercell frame
+        all_frac_coords = [
+            np.array([site.frac_coords for site in member]) @ np.linalg.inv(sc_mat) for member in orbit
+        ]
+        # possible equivalent translations
+        cosets = lattice_points_in_supercell(sc_mat) if target_frac_coords is not None else [0]
+
+        # all max complex min image distance complexes at any translation
+        equiv_complexes = [
+            (int(idx), all_frac_coords[idx] + coset)
+            for idx in np.flatnonzero(min_image_dists.round(4) == min_image_dists.max().round(4))
+            for coset in cosets
+        ]  # (index in orbit, (n,3) frac coords)
+
+        # distances of the complex centroids from target_frac_coords
+        centroids = np.array([np.mean(frac_coords, axis=0) for _idx, frac_coords in equiv_complexes])
+        target_dists = (
+            sc_structure.lattice.get_all_distances(centroids, target_frac_coords).ravel()
+            if target_frac_coords is not None
+            else np.zeros(len(centroids))
+        )
+
+        # sort: distance from target frac coords, then centroid magnitude then coords, then all
+        # constituent coords
+        best, frac_coords = equiv_complexes[
+            min(
+                range(len(equiv_complexes)),
+                key=lambda i: (
+                    round(float(target_dists[i]), 4),  # dist to target frac coords
+                    round(float(np.linalg.norm(centroids[i])), 4),  # centroid magnitude, then coords
+                    *np.round(np.abs(centroids[i]), 4),
+                    *np.round(equiv_complexes[i][1], 4).ravel(),  # all constituent coordinates
+                ),
+            )
+        ]
+        sites, min_image_dist, cart_coords = orbit[best], min_image_dists[best], all_cart_coords[best]
+
+        span = float(  # largest separation between constituents
+            np.linalg.norm(cart_coords[:, None, :] - cart_coords[None, :, :], axis=-1).max()
+        )
+        if min_image_dist < span * min_span_factor:
+            warnings.warn(
+                f"The complex minimum image distance of {self.name} in this supercell "
+                f"({min_image_dist:.2f} Å) is "
+                + ("no larger than" if min_image_dist <= span else "not appreciably larger than")
+                + f" its span ({span:.2f} Å; the largest separation between its constituent sites), "
+                f"so its constituents are as close (or closer) to those of neighbouring complex "
+                f"images as they are to each other, and the complex is not well-defined in this "
+                f"supercell. A larger and/or complex-optimised supercell is recommended (see "
+                f"``find_ideal_complex_supercell``).",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        # build defect supercell structure
+        sc_sites = [
+            PeriodicSite(site.species, site_frac_coords, sc_structure.lattice)
+            for site, site_frac_coords in zip(sites, frac_coords, strict=True)
+        ]
+        sc_defect_struct = defect_structure_from_sites(
+            sc_structure,
+            vacancy_sites=[
+                site
+                for defect, site in zip(self.defects, sc_sites, strict=True)
+                if isinstance(defect, core.Vacancy)
+            ],
+            interstitial_sites=[
+                site
+                for defect, site in zip(self.defects, sc_sites, strict=True)
+                if isinstance(defect, core.Interstitial)
+            ],
+            substitution_sites=[
+                site
+                for defect, site in zip(self.defects, sc_sites, strict=True)
+                if isinstance(defect, core.Substitution)
+            ],
+        )
+        sc_defect_struct.remove_oxidation_states()
+        for site in sc_sites:
+            remove_site_oxi_state(site)
+
+        if dummy_species is not None:  # mark the complex centroid
+            sc_defect_struct.append(dummy_species, np.mean([s.frac_coords for s in sc_sites], axis=0))
+
+        return (sc_defect_struct, sc_sites) if return_sites else sc_defect_struct
 
     def __repr__(self) -> str:
         """
