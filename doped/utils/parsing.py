@@ -2270,6 +2270,7 @@ def _get_defect_supercell_frac_coords(
     return sc_defect_frac_coords
 
 
+# TODO merge with complex function
 def _get_defect_supercell_site(defect_entry: "DefectEntry", relaxed=True, **kwargs) -> PeriodicSite | None:
     def _return_defect_supercell_site(defect_entry: "DefectEntry", relaxed=True):
         if relaxed or defect_entry.defect.defect_type == DefectType.Interstitial:
@@ -2304,11 +2305,16 @@ def _get_defect_supercell_site(defect_entry: "DefectEntry", relaxed=True, **kwar
     return _return_defect_supercell_site(defect_entry, relaxed=relaxed)
 
 
-def _get_defect_supercell_sites(defect_entry: "DefectEntry", **kwargs) -> list[PeriodicSite] | None:
+def _get_defect_supercell_sites(
+    defect_entry: "DefectEntry", relaxed=True, **kwargs
+) -> list[PeriodicSite] | None:
     """
     Get the constituent point defect sites of a defect `complex`, in the defect
-    supercell frame: the `relaxed` site for interstitials/substitutions, else
-    the vacated bulk site (as returned by ``defect_sites_from_structures``).
+    supercell frame; the plural analogue of ``_get_defect_supercell_site``.
+
+    If ``relaxed`` (default), the relaxed site is used for substitutions, else
+    the bulk site is used. The relaxed site is always used for interstitials
+    (and the bulk site for substitutions).
 
     Returns ``None`` if ``defect_entry`` is not a defect complex, or if the
     constituent site information could not be determined.
@@ -2318,25 +2324,33 @@ def _get_defect_supercell_sites(defect_entry: "DefectEntry", **kwargs) -> list[P
     if not isinstance(defect_entry.defect, DefectComplex):
         return None
 
-    def _return_defect_supercell_sites(defect_entry: "DefectEntry"):
+    def _return_defect_supercell_sites(defect_entry: "DefectEntry", relaxed=True):
+        if relaxed and (sites := getattr(defect_entry, "defect_supercell_sites", None)):
+            return sites
+
         metadata = getattr(defect_entry, "calculation_metadata", None) or {}
         if metadata.get("bulk_sites") and metadata.get("defect_site_indices"):
             defect_supercell = _get_defect_supercell(defect_entry)
-            return [  # ``defect_site_indices`` is ``None`` for vacancies (no atom in the defect supercell)
-                defect_supercell[index] if index is not None else bulk_site
-                for bulk_site, index in zip(
-                    metadata["bulk_sites"], metadata["defect_site_indices"], strict=True
+            return [  # defect_site_indices is ``None`` for vacancies
+                defect_supercell[index]
+                if index is not None and (relaxed or constituent.defect_type == DefectType.Interstitial)
+                else bulk_site  # always the relaxed site for interstitials
+                for constituent, bulk_site, index in zip(
+                    defect_entry.defect.defects,
+                    metadata["bulk_sites"],
+                    metadata["defect_site_indices"],
+                    strict=True,
                 )
             ]
         return None
 
-    if defect_supercell_sites := _return_defect_supercell_sites(defect_entry):
+    if defect_supercell_sites := _return_defect_supercell_sites(defect_entry, relaxed=relaxed):
         return defect_supercell_sites
 
     # otherwise need to reparse info:
     _update_defect_entry_structure_metadata(defect_entry, **kwargs)
 
-    return _return_defect_supercell_sites(defect_entry)
+    return _return_defect_supercell_sites(defect_entry, relaxed=relaxed)
 
 
 def _update_defect_entry_structure_metadata(

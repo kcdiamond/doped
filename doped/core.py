@@ -100,6 +100,8 @@ class DefectEntry(thermo.DefectEntry):
         defect_supercell: Structure | None = None,
         defect_supercell_site: PeriodicSite | None = None,
         equivalent_supercell_sites: list[PeriodicSite] | None = None,
+        defect_supercell_sites: list[PeriodicSite] | None = None,
+        equivalent_supercell_complexes: list[list[PeriodicSite]] | None = None,
         bulk_supercell: Structure | None = None,
         _bulk_entry_energy: float | None = None,
         _sc_entry_energy: float | None = None,
@@ -181,6 +183,19 @@ class DefectEntry(thermo.DefectEntry):
             equivalent_supercell_sites:
                 List of ``pymatgen`` |PeriodicSite| objects of
                 symmetry-equivalent defect sites in the defect supercell.
+            defect_supercell_sites:
+                For defect complexes, the ``pymatgen`` |PeriodicSite|
+                objects of the constituent point defects in the defect
+                supercell (ordered as ``DefectComplex.defects``). ``None`` for
+                point defects, for which ``defect_supercell_site`` is used instead:
+                the complex centroid is given by ``defect_supercell_site`` and
+                ``sc_defect_frac_coords``.
+            equivalent_supercell_complexes:
+                For defect complexes, the symmetry-equivalent placements of
+                the complex in the defect supercell, each a list of
+                constituent |PeriodicSite| objects, ordered as
+                ``defect_supercell_sites``. ``None`` for point defects, for
+                which ``equivalent_supercell_sites`` is used instead.
             bulk_supercell:
                 ``pymatgen`` |Structure| object of the bulk (pristine,
                 defect-free) supercell.
@@ -218,6 +233,8 @@ class DefectEntry(thermo.DefectEntry):
         self.equivalent_supercell_sites = (
             equivalent_supercell_sites if equivalent_supercell_sites is not None else []
         )
+        self.defect_supercell_sites = defect_supercell_sites  # ``None`` for point defects
+        self.equivalent_supercell_complexes = equivalent_supercell_complexes
         self.bulk_supercell = bulk_supercell
         self._bulk_entry_energy = _bulk_entry_energy
         self._sc_entry_energy = _sc_entry_energy
@@ -3262,7 +3279,13 @@ class DefectComplex(core.DefectComplex, Defect):
                 "All constituent point defects of a `DefectComplex` must share the same host structure."
             )
 
-        # TODO sort on init?
+        # TODO: sort on init, so that any DefectComplex has canonical order regardless of how it was
+        # constructed (rather than only those from _sorted_defect_complex)?
+        # e.g. split sorted_defect_complex into a sorting function to call here, maybe add a
+        # DefectComplex._from_sorted method for internal callers we know have already sorted because
+        # they need the sort index. we can do a 2D sort here over both orbit elements and constituents,
+        # if done as intended they should commute
+        # TODO: warning for coincident sites - map_to_unit_cell should be False for your constituents?
         self.defects = defects
         self.equivalent_complexes = equivalent_complexes
         self.point_group = point_group
@@ -3499,7 +3522,7 @@ class DefectComplex(core.DefectComplex, Defect):
         min_length: float | None = None,  # as in Defect for compatibility
         dummy_species: str | None = None,
         min_span_factor: float = 1.5,
-    ) -> Structure | tuple[Structure, list[PeriodicSite]]:
+    ) -> Structure | tuple[Structure, list[PeriodicSite], list[list[PeriodicSite]]]:
         r"""
         Generate the simulation supercell for the defect complex.
 
@@ -3530,9 +3553,11 @@ class DefectComplex(core.DefectComplex, Defect):
                 closest equivalent position to these fractional coordinates in
                 the supercell, while keeping the supercell fixed.
             return_sites (bool):
-                If ``True``, returns a tuple of the defect supercell and the
-                constituent sites (ordered as ``self.defects``).
-                (Default: False)
+                If ``True``, returns a tuple of the defect supercell, the
+                constituent sites therein (ordered as ``self.defects``), and
+                all symmetry-equivalent placements of the complex in the
+                supercell (each a list of constituent sites, in the same
+                order). (Default: False)
             min_image_distance (float | None):
                 Minimum complex minimum image distance (in Å) of the generated
                 supercell, if ``sc_mat`` is ``None``. If ``None`` (default),
@@ -3562,9 +3587,10 @@ class DefectComplex(core.DefectComplex, Defect):
                 image distance triggers a warning. (Default: 1.5)
 
         Returns:
-            |Structure| | tuple[|Structure|, list[|PeriodicSite|]]:
+            |Structure| | tuple[|Structure|, list[|PeriodicSite|], list[list[|PeriodicSite|]]]:
                 The defect supercell structure, and if ``return_sites`` is
-                ``True``, the constituent sites.
+                ``True``, the constituent sites therein and all equivalent
+                placements of the complex in the supercell.
         """
         from pymatgen.util.coord import lattice_points_in_supercell
 
@@ -3693,7 +3719,23 @@ class DefectComplex(core.DefectComplex, Defect):
         if dummy_species is not None:  # mark the complex centroid
             sc_defect_struct.append(dummy_species, np.mean([s.frac_coords for s in sc_sites], axis=0))
 
-        return (sc_defect_struct, sc_sites) if return_sites else sc_defect_struct
+        if not return_sites:
+            return sc_defect_struct
+
+        # construct all equivalent supercell frame complexes
+        equiv_sc_complexes = [
+            [
+                PeriodicSite(site.species, site_frac_coords, sc_structure.lattice)
+                for site, site_frac_coords in zip(member, member_frac_coords + coset, strict=True)
+            ]
+            for member, member_frac_coords in zip(orbit, all_frac_coords, strict=True)
+            for coset in lattice_points_in_supercell(sc_mat)
+        ]
+        for equiv_sc_complex in equiv_sc_complexes:
+            for site in equiv_sc_complex:
+                remove_site_oxi_state(site)
+
+        return sc_defect_struct, sc_sites, equiv_sc_complexes
 
     def __repr__(self) -> str:
         """
