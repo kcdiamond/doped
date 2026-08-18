@@ -2082,7 +2082,7 @@ def get_defect_complex_name(
 
     The name is then constructed from this chain, with shortest separation
     first, with the distances between successive point defects interleaved,
-    and the point group appended, e.g. ``v_Cd-1.87-Cd_i-1.87-v_Cd_C3v``.
+    and the point group appended, e.g. ``v_Cd-1.87-Cd_i-1.87-v_Cd-C3v``.
 
     This name is not necessarily unique, and may be shared by distinct
     inequivalent complexes. The name is invariant under permutation of the
@@ -2124,7 +2124,6 @@ def get_defect_complex_name(
     Returns:
         str: The name of the defect complex (without charge state).
     """
-    # TODO check hyphen doesn't break any charge parsing
     from doped.generation import _defect_sort_key, _get_element_list
 
     if element_list is None:
@@ -2157,7 +2156,7 @@ def get_defect_complex_name(
         parts += ([f"{sep:.{prec}f}"] if include_separations else []) + [names[idx]]
 
     point_group = defect_complex.point_group if include_point_group else None
-    return "-".join(parts) + (f"_{point_group}" if point_group else "")
+    return "-".join(parts) + (f"-{point_group}" if point_group else "")
 
 
 @contextlib.contextmanager
