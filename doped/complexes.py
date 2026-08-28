@@ -1278,6 +1278,7 @@ def is_periodic_image(
 
 # maybe should be changed to a consistent metric for large tolerances
 # ie check over all periodic images and assignments for min dist
+# TODO switch to min over max to match vectorised
 def _complex_frac_coords_dist(
     labels_1: Sequence[Hashable],
     frac_coords_1: np.ndarray,
@@ -1328,6 +1329,87 @@ def _complex_frac_coords_dist(
         max_dist = max(max_dist, np.max(cart_dists[np.arange(len(matches)), matches]))
 
     return float(max_dist)
+
+
+def _complex_frac_coords_dists(
+    labels_1: Sequence[Hashable],
+    frac_coords_1: np.ndarray,
+    labels_2: Sequence[Hashable],
+    frac_coords_2: np.ndarray,
+    lattice: Lattice,
+) -> np.ndarray:
+    """
+    Batched form of ``_complex_frac_coords_dist``: the smallest, max per-site
+    distance from each of ``k`` complex configurations to each of ``m`` complex
+    configurations, over all possible assignments, vectorised.
+
+    Args:
+        labels_1 (Sequence[Hashable]):
+            Labels (e.g. species strings) of the point defects in the
+            first complexes.
+        frac_coords_1 (np.ndarray):
+            ``(k, n, 3)`` fractional coordinates of the ``k`` first
+            complexes (``(n, 3)`` is also accepted, for one).
+        labels_2 (Sequence[Hashable]):
+            Labels of the point defects in the second complexes, matching
+            the ordering of ``frac_coords_2``.
+        frac_coords_2 (np.ndarray):
+            ``(m, n, 3)`` fractional coordinates of the ``m`` complexes to
+            compare against (``(n, 3)`` is also accepted, for one).
+        lattice (|Lattice|):
+            Lattice to which the fractional coordinates correspond.
+
+    Returns:
+        np.ndarray:
+            ``(k, m)`` array of maximum matched per-site distances (in Å), or
+            ``np.inf`` if the compositions differ. Always 2D.
+    """
+    # single complex given on either arg: (n,3) -> (1,n,3)
+    fcs_1 = np.asarray(frac_coords_1, dtype=float)
+    if fcs_1.ndim == 2:
+        fcs_1 = fcs_1[None]
+    fcs_2 = np.asarray(frac_coords_2, dtype=float)
+    if fcs_2.ndim == 2:
+        fcs_2 = fcs_2[None]
+
+    # compositions differ - no tolerance
+    if Counter(labels_1) != Counter(labels_2):
+        return np.full((len(fcs_1), len(fcs_2)), np.inf)
+
+    # integer lattice translation to align centroids
+    int_shifts = np.round(  # (k, m, 3)
+        fcs_1.mean(axis=1)[:, None, :] - fcs_2.mean(axis=1)[None, :, :]
+    )
+    shifted = fcs_2[None] + int_shifts[:, :, None, :]  # (k, m, n, 3)
+
+    # evaluate all distances
+    cart_disps = (  # (k, m, n, n, 3)
+        fcs_1[:, None, :, None, :] - shifted[:, :, None, :, :]
+    ) @ lattice.matrix
+    dists = np.linalg.norm(cart_disps, axis=-1)  # (k, m, n, n)
+
+    # per label, min over all possible assignments, get max dist
+    labels_arr_1, labels_arr_2 = np.asarray(labels_1), np.asarray(labels_2)
+    max_dists = np.zeros((len(fcs_1), len(fcs_2)))  # (k, m)
+    for label in set(labels_1):
+        # get block for this label
+        idx_1 = np.nonzero(labels_arr_1 == label)[0]
+        idx_2 = np.nonzero(labels_arr_2 == label)[0]
+        block = dists[:, :, idx_1[:, None], idx_2[None, :]]  # (k, m, b, b) for num of label b
+
+        # min over all possible assignments, get max
+        max_dists = np.maximum(
+            max_dists,
+            np.min(
+                [
+                    block[:, :, np.arange(len(idx_1)), perm].max(axis=2)
+                    for perm in permutations(range(len(idx_2)))
+                ],
+                axis=0,
+            ),
+        )
+
+    return max_dists
 
 
 def cluster_complexes_by_dist_tol(
@@ -1794,8 +1876,7 @@ def _get_complex_orbit_fcs_in_prim(
     dist_tol = dist_tol_factor * symprec
     lattice = primitive.lattice
 
-    # centre the complex (centroid to unit primitive); not in-place, as ``point_fcs`` is the
-    # caller's array (e.g. shared with the candidate complexes in ``_reduce_equivalent_complexes``)
+    # centre the complex (centroid to unit primitive)
     point_labels = list(labels)
     point_fcs = np.asarray(point_fcs, dtype=float)
     point_fcs = point_fcs - np.floor(np.mean(point_fcs, axis=0))
@@ -1961,18 +2042,22 @@ def _sort_complex_orbit(
     # sort complexes by key
     sort_index = sorted(
         range(len(orbit)),
-        key=lambda k: _complex_key(labels, [site.frac_coords for site in orbit[k]], prec=prec),
+        key=lambda k: _complex_config_sort_key(labels, [site.frac_coords for site in orbit[k]], prec=prec),
     )
     sorted_orbit = [orbit[k] for k in sort_index]
 
     return sorted_orbit, sort_index
 
 
-def _complex_key(labels: Sequence[Hashable], frac_coords: Sequence | np.ndarray, prec: int = 5) -> tuple:
+def _complex_config_sort_key(
+    labels: Sequence[Hashable],
+    frac_coords: Sequence | np.ndarray,
+    prec: int = 5,
+) -> tuple:
     """
-    Return deterministic hashable key for a defect complex configuration, based
-    on labels and frac coords. Matches complex up to integer lattice
-    translation but no other symmetry operations.
+    Return a deterministic sort key for a defect complex configuration, based
+    on labels and frac coords. Orders configurations up to integer lattice
+    translation, but no other symmetry operations.
 
     This is keyed on largely non-invariant properties of the complex, as it is
     meant largely for sorting symmetry-equivalent configurations of a single
@@ -1990,14 +2075,54 @@ def _complex_key(labels: Sequence[Hashable], frac_coords: Sequence | np.ndarray,
             (Default: 5)
 
     Returns:
-        tuple: Hashable key for the defect complex configuration.
+        tuple: Sort key for the defect complex configuration.
     """
-    # TODO check about using _frac_coords_sort_func here with fixed precision
     frac_coords = np.asarray(frac_coords)
     centroid = np.mean(frac_coords, axis=0)
     rel_fcs = np.round(frac_coords - centroid, prec)
+    # round before wrapping to unit cell for float noise
+    centroid = np.mod(np.round(centroid, prec), 1.0)
     return (
-        _frac_coords_sort_func(centroid - np.floor(centroid)),
+        _frac_coords_sort_func(centroid),
+        tuple(sorted(zip(labels, map(tuple, rel_fcs), strict=True))),
+    )
+
+
+def _complex_config_key(
+    labels: Sequence[Hashable],
+    frac_coords: Sequence | np.ndarray,
+    prec: int = 5,
+) -> tuple:
+    """
+    Return a unique hashable key identifying a defect complex configuration,
+    for matching identical configurations, invariant to integer lattice
+    translation and to the constituent ordering, but no other symmetry
+    operations.
+
+    Used for fast exact-match path for checking equal configurations.
+
+    Args:
+        labels (Sequence[Hashable]):
+            Labels (e.g. species strings) of the constituent point defects.
+        frac_coords (Sequence | np.ndarray):
+            ``(n, 3)`` array of (unwrapped) fractional coordinates of the
+            constituent point defects.
+        prec (int):
+            Number of decimal places to which the centroid and
+            centroid-relative fractional coordinates are rounded (should be
+            finer than the fractional equivalent of the matching distance tolerance). (Default: 5)
+
+    Returns:
+        tuple: Hashable key for the defect complex configuration.
+    """
+    frac_coords = np.asarray(frac_coords)
+    centroid = np.mean(frac_coords, axis=0)
+    rel_fcs = np.round(frac_coords - centroid, prec)
+    # round before wrapping to the unit cell for float noise, then round again
+    # for exact matching as mod can reintroduce it
+    centroid = np.round(np.mod(np.round(centroid, prec), 1.0), prec)
+    return (
+        tuple(centroid),
         tuple(sorted(zip(labels, map(tuple, rel_fcs), strict=True))),
     )
 
@@ -2038,18 +2163,41 @@ def _reduce_equivalent_complexes(
     """
     lattice = primitive.lattice
     dist_tol = dist_tol_factor * symprec
-    seen: dict[tuple, tuple[Sequence[Hashable], np.ndarray]] = {}  # {key: labels and frac coords}
-    inequivalent = []
+
+    # get fractional rounding tolerance
+    max_frac_deviation = (
+        dist_tol * np.linalg.norm(lattice.reciprocal_lattice_crystallographic.matrix, axis=1).max()
+    )  # largest fractional coordinate shift allowed by dist_tol: with r=fL, f_i=L*_i.r,
+    # |df_i| <= |L*_i|dr, +3dp excess precision for exact match to be safe
+    key_prec = max(int(np.floor(-np.log10(max(max_frac_deviation, 1e-12)))) + 3, 3)
+
+    # initialise recording sets
+    seen: set[tuple] = set()  # keys of all recorded orbit elements for all seen complexes
+    by_composition: dict[tuple, list[np.ndarray]] = {}  # complexes by composition for matching
+    inequivalent = []  # for output, see Returns
 
     for idx, (labels, complex_fcs) in enumerate(complexes):
-        frac_coords = np.asarray(complex_fcs)  # array needed for the label masking below
-        # check with _complex_frac_coords_dist explicitly - we assume _complex_key
-        # with constituent fcs at prec=5 and centroid at prec=3-4 is more discriminating
-        # (with reasonable cells/dist_tol)
-        prev = seen.get(_complex_key(labels, frac_coords))
-        if prev is not None and _complex_frac_coords_dist(labels, frac_coords, *prev, lattice) <= dist_tol:
+        # check for exact match in seen to skip more expensive distance check
+        frac_coords = np.asarray(complex_fcs)
+        if _complex_config_key(labels, frac_coords, prec=key_prec) in seen:
+            continue
+
+        # no exact match -> actual distance check
+        order = np.argsort(np.asarray(labels, dtype=object))
+        composition = tuple(np.asarray(labels, dtype=object)[order])
+        members = by_composition.get(composition)  # only check against same composition
+        if (
+            members is not None
+            and (
+                _complex_frac_coords_dists(
+                    composition, frac_coords[order], composition, np.asarray(members), lattice
+                )
+                <= dist_tol
+            ).any()
+        ):
             continue  # already seen
 
+        # not seen -> generate orbit
         orbit_fcs, point_group = _get_complex_orbit_fcs_in_prim(
             frac_coords,
             labels,
@@ -2058,10 +2206,15 @@ def _reduce_equivalent_complexes(
             symprec=symprec,
             dist_tol_factor=dist_tol_factor,
         )
-        for member_fcs in orbit_fcs:  # record the whole orbit as seen
-            seen[_complex_key(labels, member_fcs)] = (labels, member_fcs)
-        inequivalent.append((idx, orbit_fcs, point_group))
 
+        # mark whole orbit as seen, and record composition
+        recorded = by_composition.setdefault(composition, [])
+        for member_fcs in orbit_fcs:
+            seen.add(_complex_config_key(labels, member_fcs, prec=key_prec))
+            recorded.append(np.asarray(member_fcs)[order])
+
+        # return inequivalent complexes generated
+        inequivalent.append((idx, orbit_fcs, point_group))
     return inequivalent
 
 
@@ -2524,7 +2677,9 @@ def _complex_from_orbit_coords(
     # sort before constructing Defect objects such that Defect objects correspond to
     # equivalent_complexes[0]
     defect_names = [defect.name for defect in defects]
-    orbit = orbit[sorted(range(len(orbit)), key=lambda idx: _complex_key(defect_names, orbit[idx]))]
+    orbit = orbit[
+        sorted(range(len(orbit)), key=lambda idx: _complex_config_sort_key(defect_names, orbit[idx]))
+    ]
 
     # Defect object construction
     lattice = defects[0].structure.lattice
@@ -2603,11 +2758,13 @@ def _sorted_defect_complex(
     sorted_defects = [defects[i] for i in sort_index]
     sorted_orbit = [[member[i] for i in sort_index] for member in orbit]
 
-    # then sort the orbit members: _complex_key is invariant to the constituent ordering, so
+    # then sort the orbit members: _complex_config_sort_key is invariant to the constituent ordering, so
     # this is independent of both input orderings (may already be sorted, e.g. as currently the
     # case in both generation and analysis, but keeps this ordering deterministic)
     names = [defect.name for defect in sorted_defects]
-    sorted_orbit.sort(key=lambda member: _complex_key(names, [site.frac_coords for site in member]))
+    sorted_orbit.sort(
+        key=lambda member: _complex_config_sort_key(names, [site.frac_coords for site in member])
+    )
 
     return (
         DefectComplex(
