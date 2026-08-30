@@ -3437,7 +3437,6 @@ class DefectComplex(core.DefectComplex, Defect):
         )
         return len(self.equivalent_complexes)
 
-    # TODO like 100x slower than Defect.__eq__ look into this
     def __eq__(self, other) -> bool:
         """
         Determine whether two ``DefectComplex`` objects are equal.
@@ -3449,56 +3448,32 @@ class DefectComplex(core.DefectComplex, Defect):
         equality is symmetric.
         """
         if not isinstance(other, core.Defect):
-            raise TypeError("Can only compare `Defect`s with `Defect`s!")
+            return NotImplemented
         if not isinstance(other, core.DefectComplex):
             return False  # unless we want to check if point defect = complex with one constituent?
+
         if self is other:
             return True
+
         if self.name != other.name:
             return False
 
-        dist_tol = min(self.symprec, other.symprec)
+        symprec = min(self.symprec, getattr(other, "symprec", self.symprec))
 
-        from doped.complexes import (
-            _get_complex_orbit_in_prim,
-            _unwrap_and_transform_to_prim,
-            is_periodic_image,
-        )
-        from doped.utils.symmetry import get_primitive_structure
+        # quick check for exact match - no symmetry other than integer lattice translation
+        if self.structure == other.structure and [defect.name for defect in self.defects] == [
+            defect.name for defect in other.defects
+        ]:
+            self_fcs = np.array([defect.site.frac_coords for defect in self.defects])
+            other_fcs = np.array([defect.site.frac_coords for defect in other.defects])
+            shift = np.round(self_fcs.mean(axis=0) - other_fcs.mean(axis=0))
+            disps = (self_fcs - other_fcs - shift) @ self.structure.lattice.matrix
+            if np.linalg.norm(disps, axis=-1).max() < symprec:
+                return True
 
-        # check the two primitives
-        primitive = get_primitive_structure(self.structure, symprec=dist_tol)
-        prim_2 = get_primitive_structure(other.structure, symprec=dist_tol)
-        if (
-            len(prim_2) != len(primitive)
-            or prim_2.composition.reduced_formula != primitive.composition.reduced_formula
-        ):
-            return False
+        from doped.complexes import _get_min_dist_between_equiv_complexes
 
-        # try to fold to same primitive
-        try:
-            self_prim_sites, other_prim_sites = [
-                _unwrap_and_transform_to_prim(
-                    cplx.structure,
-                    [defect.site for defect in cplx.defects],
-                    primitive_structure=primitive,
-                    symprec=dist_tol,
-                    # if structure is primitive, assume already unwrapped
-                    image_cells=(
-                        np.zeros((len(cplx.defects), 3), dtype=int)
-                        if len(cplx.structure) == len(cplx_prim)
-                        else None
-                    ),
-                )
-                for cplx, cplx_prim in ((self, primitive), (other, prim_2))
-            ]
-        except RuntimeError:  # structures don't match
-            return False
-
-        # orbit sorting should be deterministic
-        self_rep = _get_complex_orbit_in_prim(self_prim_sites, primitive, symprec=dist_tol)[0][0]
-        other_rep = _get_complex_orbit_in_prim(other_prim_sites, primitive, symprec=dist_tol)[0][0]
-        return is_periodic_image(self_rep, other_rep, dist_tol=dist_tol)
+        return _get_min_dist_between_equiv_complexes(self, other, symprec=symprec) < symprec
 
     def __hash__(self):
         """

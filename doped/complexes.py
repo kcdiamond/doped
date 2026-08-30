@@ -1412,6 +1412,140 @@ def _complex_frac_coords_dists(
     return max_dists
 
 
+def _get_min_dist_between_equiv_complexes(
+    complex_1: "DefectComplex | Sequence[PeriodicSite]",
+    complex_2: "DefectComplex | Sequence[PeriodicSite]",
+    structure: Structure | None = None,
+    structure_2: Structure | None = None,
+    strip_oxi_states: bool | None = None,
+    symprec: float = 0.01,
+) -> float:
+    """
+    Get the minimum distance (in Å) between symmetry-equivalent configurations
+    of two defect complexes, according to the ``_complex_frac_coords_dist``
+    metric, otherwise analogous to ``get_min_dist_between_equiv_sites``.
+
+    Args:
+        complex_1 (|DefectComplex| | Sequence[|PeriodicSite|]):
+            First defect complex, as a |DefectComplex| object or a sequence
+            of its (unwrapped) constituent point defect sites.
+        complex_2 (|DefectComplex| | Sequence[|PeriodicSite|]):
+            Second defect complex, similarly.
+        structure (|Structure| | None):
+            Host structure in which ``complex_1`` is defined. Required if
+            ``complex_1`` is not a |DefectComplex| object. Default: None.
+        structure_2 (|Structure| | None):
+            Separate host |Structure| for ``complex_2``, if the two sites are
+            potentially defined in different (but equivalent) host frames --
+            e.g. differently-oriented/-defined cells, primitive vs supercell
+            definitions, or differently oxi-state-decorated hosts. Each site
+            is then folded via its own host into a shared canonical primitive
+            cell (from ``get_primitive_structure``) for comparison, returning
+            ``np.inf`` if the two hosts do not correspond to matching primitive
+            structures. If ``None`` (default), taken from ``complex_2`` if it is a
+            |Defect|/|DefectEntry| object, otherwise assumed to match
+            ``structure``.
+        strip_oxi_states (bool | None):
+            Whether to strip oxidation states from the host structure(s)
+            before symmetry analysis / host matching. If ``None`` (default),
+            oxidation states are only stripped when the two host structures
+            (``structure``/``structure_2``) have mismatching oxi-state
+            decorations (which can otherwise hinder host matching) -- so
+            consistently-decorated hosts retain any decoration-dependent
+            symmetry (e.g. inequivalent sites in mixed-valence hosts). Set to
+            ``True``/``False`` to always/never strip oxidation states.
+        symprec (float):
+            Symmetry precision for determining the shared primitive cell and
+            its space group operations. Default is 0.01.
+
+    Returns:
+        float:
+            Minimum distance (in Å) between symmetry-equivalent
+            configurations of ``complex_1`` and ``complex_2``, or ``np.inf``
+            if their constituent species or host structures do not match.
+    """
+    # TODO align symmetry kwargs with point version
+
+    # parsing
+    def _parse_sites_and_structure(
+        cplx: "DefectComplex | Sequence[PeriodicSite]",
+        structure: Structure | None,
+    ) -> tuple[list[PeriodicSite], Structure | None]:
+        if isinstance(cplx, DefectComplex):
+            return [defect.site for defect in cplx.defects], cplx.structure
+        return list(cplx), structure
+
+    sites_1, structure = _parse_sites_and_structure(complex_1, structure)
+    sites_2, structure_2 = _parse_sites_and_structure(complex_2, structure_2)
+    if structure is None:
+        raise ValueError("``structure`` must be provided if ``complex_1`` is not a ``DefectComplex``.")
+    if structure_2 is None:
+        structure_2 = structure
+
+    if strip_oxi_states is None:  # default: strip only when mismatching decorations
+        strip_oxi_states = {str(sp) for sp in structure.composition} != {
+            str(sp) for sp in structure_2.composition
+        }  # compare based on species string sets; ``Composition`` equality is oxi-state-insensitive
+
+    if strip_oxi_states:
+        structure, structure_2 = structure.copy(), structure_2.copy()
+        structure.remove_oxidation_states()
+        structure_2.remove_oxidation_states()
+
+    # use oxi-state-insensitive labels if hosts stripped
+    labels_1, labels_2 = [
+        [
+            str(site.species.element_composition) if strip_oxi_states else site.species_string
+            for site in cplx_sites
+        ]
+        for cplx_sites in (sites_1, sites_2)
+    ]
+
+    # different constituent point defects -> no tolerance
+    if Counter(labels_1) != Counter(labels_2):
+        return np.inf
+
+    primitive = get_primitive_structure(structure, symprec=symprec)
+    if structure_2 != structure:  # fast-fail for clearly-different host crystals:
+        prim_2 = get_primitive_structure(structure_2, symprec=symprec)
+        if (
+            len(prim_2) != len(primitive)
+            or prim_2.composition.reduced_formula != primitive.composition.reduced_formula
+        ):
+            return np.inf
+
+    try:  # try fold each complex into the shared primitive cell:
+        prim_fcs_1, prim_fcs_2 = [
+            np.array(
+                [
+                    site.frac_coords
+                    for site in _unwrap_and_transform_to_prim(
+                        host,
+                        cplx_sites,
+                        primitive_structure=primitive,
+                        symprec=symprec,
+                        image_cells=np.zeros((len(cplx_sites), 3), dtype=int),  # already unwrapped
+                    )
+                ]
+            )
+            for cplx_sites, host in ((sites_1, structure), (sites_2, structure_2))
+        ]
+    except RuntimeError:  # host structures don't match
+        return np.inf
+
+    # generate the full orbit of complex_1 (all operations, skip clustering):
+    sga, _symprec = get_sga_and_symprec(primitive, symprec)
+    quotient_ops = sga.get_symmetry_operations()
+    rotations = np.array([op.rotation_matrix for op in quotient_ops])  # (n_ops, 3, 3)
+    translations = np.array([op.translation_vector for op in quotient_ops])  # (n_ops, 3)
+    images = np.einsum("oij,nj->oni", rotations, prim_fcs_1) + translations[:, None, :]
+    images -= np.floor(np.mean(images, axis=1, keepdims=True))  # (n_ops, n_sites, 3)
+
+    return float(
+        _complex_frac_coords_dists(labels_2, prim_fcs_2, labels_1, images, primitive.lattice).min()
+    )
+
+
 def cluster_complexes_by_dist_tol(
     complexes: list[list[PeriodicSite]],
     dist_tol: float = 0.01,
