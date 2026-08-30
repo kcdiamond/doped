@@ -5,7 +5,7 @@ Code for generating and analysing defect complexes.
 import contextlib
 import math
 import warnings
-from collections import Counter
+from collections import Counter, defaultdict
 from collections.abc import Hashable, Iterable, Iterator, Sequence
 from copy import deepcopy
 from functools import lru_cache
@@ -2618,7 +2618,7 @@ def get_complex_chains(
 
 def get_complex_clusters(
     defects: dict[str, Defect],
-    names: Sequence[str] | None = None,
+    names: Sequence[str | Sequence[str]] | None = None,
     size: int | tuple[int, int] = 2,
     max_diameter: float = 3.0,
     min_separation: float = 0.0,
@@ -2647,14 +2647,17 @@ def get_complex_clusters(
         defects (dict[str, Defect]):
             The point defects available as cluster constituents (sharing a
             common primitive host structure), as ``{name: Defect}``.
-        names (Sequence[str]):
+        names (Sequence[str | Sequence[str]]):
             Names of the point defects (from ``defects``) to use as cluster
             constituents. A name may be listed more than once, giving the
             number of times that point defect can appear in a cluster when
             ``allow_repeats`` is ``False`` (e.g. ``["v_Cd", "v_Cd", "Cd_i"]``
             with ``size=3, allow_repeats=False`` gives only
-            ``v_Cd+v_Cd+Cd_i`` type complexes). If ``None`` (default), each
-            point defect in ``defects`` is available once.
+            ``v_Cd+v_Cd+Cd_i`` type complexes). An entry may itself be a
+            group of names, which then count as one constituent between
+            them; e.g. ``["v_Cd", ["Cd_i", "Te_i"]]`` to permit a single Cd interstitial of any
+            type in the cluster. Note groups are assumed disjoint or identical,
+            partially overlapping groups are not supported.
         size (int | tuple[int, int]):
             Number of constituent point defects in the generated clusters,
             or a ``(min, max)`` range. (Default: 2)
@@ -2693,12 +2696,18 @@ def get_complex_clusters(
     min_size, max_size = (size, size) if isinstance(size, int) else size
     if names is None:
         names = list(defects)  # each defect available once
-    pool_names = list(dict.fromkeys(names))  # distinct point defects
+    groups = [[name] if isinstance(name, str) else list(name) for name in names]
+    pool_names = list(dict.fromkeys(n for group in groups for n in group))  # distinct point defects
     pool = [defects[name] for name in pool_names]
 
-    # count available number of each defect: because we allow for eg [v_Cd,v_Cd,Cd_i],
-    # allow_repeats=False,size=3 to give v_Cd+v_cd+Cd_i type complexes only
-    counts = Counter(pool_names.index(name) for name in names)
+    # count available number of each group of defects: because we allow for eg [v_Cd,v_Cd,Cd_i],
+    # allow_repeats=False,size=3 to give v_Cd+v_cd+Cd_i type complexes only.
+    # grouped names share a single count between them
+    counts = Counter(frozenset(pool_names.index(name) for name in group) for group in groups)
+    constraints = defaultdict(list)  # {pool index: [(group, count), ...]} it could violate
+    for group, count in counts.items():
+        for idx in group:
+            constraints[idx].append((group, count))
     primitive = pool[0].structure
 
     frac_coords, site_defects, site_neighbours = _get_candidate_site_graph(
@@ -2742,8 +2751,11 @@ def get_complex_clusters(
 
                     new_coords = np.vstack([coords, new_fcs])
                     for defect in site_defects[site]:
-                        if not allow_repeats and cluster_defects.count(defect) >= counts[defect]:
-                            continue
+                        if not allow_repeats and any(
+                            sum(d in group for d in cluster_defects) >= count
+                            for group, count in constraints[defect]
+                        ):
+                            continue  # unacceptable composition
 
                         extended.append(
                             (new_coords, [*cluster_defects, defect], [*sites, site], [*images, image])

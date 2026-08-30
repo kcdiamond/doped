@@ -584,6 +584,28 @@ def _get_neutral_defect_entry(
     return neutral_defect_entry
 
 
+def _name_wout_charge_state(name: str) -> str:
+    """
+    Strip the charge state from a ``doped`` defect name, if present: this is
+    the last _ split if the final substring is +int or -int.
+    """
+    charge = name.rsplit("_", 1)[-1]
+    return name.rsplit("_", 1)[0] if "_" in name and charge.lstrip("+-").isdigit() else name
+
+
+def _match_defect_names(name: str, available: Iterable[str], label: str = "Defect") -> list[str]:
+    """
+    Match a given defect name against ``available`` names, ignoring any charge
+    states and allowing partial matches (see ``_check_if_name_subset``).
+    """
+    if not (matches := [n for n in available if _check_if_name_subset(n, _name_wout_charge_state(name))]):
+        raise ValueError(
+            f"{label} name {name!r} does not match any of the generated {label.lower()} names: "
+            f"{list(available)}"
+        )
+    return matches
+
+
 def _check_if_name_subset(long_name: str, poss_subset_name: str):
     """
     Check if the longer name is a superset of the shorter name, where
@@ -605,6 +627,7 @@ def _check_if_name_subset(long_name: str, poss_subset_name: str):
     if len(long_terms) != len(subset_terms) and not (
         len(subset_terms) == len(long_terms) - 1 and len(long_terms) % 2 == 0
     ):  # an even number of terms means the last is a complex point group, which may be omitted
+        # because a complex name looks like (defect-sep)*n-defect-pointgroup
         return False
 
     return all(
@@ -2551,11 +2574,11 @@ class DefectsGenerator(MSONable):
         """
         from doped.complexes import get_complex_chains  # here, to avoid a circular import
 
-        pool, names = self._complex_constituent_pool(chain, additional_defects)
+        pool, names, nested = self._complex_constituent_pool(chain, additional_defects)
         positions = (
             cast("list[list[str]]", names)  # positions given explicitly, so they set the chain
-            if names and not isinstance(names[0], str)  # length and the allowed constituents
-            else [cast("list[str]", names)] * chain_length  # any of the given defects at each position
+            if nested  # length and the allowed constituents
+            else [[name for group in names for name in group]] * chain_length  # any, at each position
         )
         show_pbar = kwargs.pop("pbar", True)
         complexes = get_complex_chains(
@@ -2613,7 +2636,12 @@ class DefectsGenerator(MSONable):
                 that point defect may appear in a cluster when ``allow_repeats``
                 is ``False``; e.g. ``["v_Cd", "v_Cd", "Cd_i"]`` with
                 ``cluster_size=3, allow_repeats=False`` gives only
-                ``v_Cd+v_Cd+Cd_i`` type complexes.
+                ``v_Cd-v_Cd-Cd_i`` type complexes. An entry may itself be a
+                group of names, which then count as one constituent between
+                them; e.g. ``["v_Cd", ["Cd_i", "Te_i"]]`` to permit a single
+                Cd interstitial OR Te interstitial in the cluster. Note groups
+                are assumed disjoint or identical, partially overlapping
+                groups are not supported.
             cluster_size (int | tuple[int, int]):
                 Number of constituent point defects in the generated
                 clusters, or a ``(min, max)`` range thereof. (Default: 2)
@@ -2646,13 +2674,13 @@ class DefectsGenerator(MSONable):
                 Additional keyword arguments, e.g. for the complex generation
                 and symmetry analysis functions in ``doped.complexes``.
         """
-        from doped.complexes import get_complex_clusters  # here, to avoid a circular import
+        from doped.complexes import get_complex_clusters  # avoid a circular import
 
-        pool, names = self._complex_constituent_pool(defects, additional_defects)
+        pool, names, _nested = self._complex_constituent_pool(defects, additional_defects)
         show_pbar = kwargs.pop("pbar", True)
         complexes = get_complex_clusters(
             pool,
-            names=cast("list[str]", names),  # repeats set constituent multiplicity
+            names=names,  # one group per given name - repeats set constituent multiplicity
             size=cluster_size,
             max_diameter=max_diameter,
             min_separation=min_separation,
@@ -2665,11 +2693,27 @@ class DefectsGenerator(MSONable):
 
         self._add_defect_complexes(complexes, pbar=show_pbar)
 
+    def _defects_by_name(self, complexes: bool = False) -> dict[str, Defect]:
+        """
+        The generated point defects (or defect complexes, if ``complexes``),
+        keyed by name without charge state, taking the neutral |DefectEntry|'s
+        |Defect| if present.
+        """
+        available: dict[str, Defect] = {}
+        for name, defect_entry in self.defect_entries.items():
+            if isinstance(defect_entry.defect, DefectComplex) is not complexes:
+                continue
+            name_wout_charge = _name_wout_charge_state(name)
+            if name_wout_charge not in available or defect_entry.charge_state == 0:
+                available[name_wout_charge] = defect_entry.defect
+
+        return available
+
     def _complex_constituent_pool(
         self,
         defects: Iterable[str] | Iterable[Iterable[str]] | str | None = None,
         additional_defects: dict[str, Defect] | None = None,
-    ) -> tuple[dict[str, Defect], list[str] | list[list[str]]]:
+    ) -> tuple[dict[str, Defect], list[list[str]], bool]:
         """
         Construct a labelled dictionary of point defects for a pool of
         constituent point defects for complexes. May take names with or without
@@ -2677,41 +2721,23 @@ class DefectsGenerator(MSONable):
         dict. Also take partial matches e.g. Cd_i will match all Cd
         interstitials if multiple.
 
-        Returns both the ``{name: Defect}`` pool and the given names resolved
-        against it, mirroring the shape of ``defects``: a flat list of names for
-        a flat (or ``None``) input, or one list per position for a nested input
-        (as taken by ``complexes.get_complex_chains``). Repeated names are
-        preserved, as these set constituent multiplicity in
-        ``complexes.get_complex_clusters``.
+        Returns the ``{name: Defect}`` pool, the given names resolved against
+        it as one group per given name (or per position, for a nested input),
+        and whether the input was nested (ie to distinguish the two uses for
+        the chains/clusters applications).
         """
-        available: dict[str, Defect] = {}  # point defects only; no complexes of complexes
-        for name, defect_entry in self.defect_entries.items():
-            if isinstance(defect_entry.defect, DefectComplex):
-                continue
-            name_wout_charge = name.rsplit("_", 1)[0]
-            # ideally we take neutral defectentry just in case
-            if name_wout_charge not in available or defect_entry.charge_state == 0:
-                available[name_wout_charge] = defect_entry.defect
+        available = self._defects_by_name()  # point defects only, no complexes of complexes
 
         def _resolve(names: Iterable[str] | str) -> list[str]:
             """
             Expand the given names against ``available``, preserving order and
             repeats.
             """
-            resolved = []
-            for defect_name in [names] if isinstance(names, str) else names:
-                name = defect_name
-                charge = name.rsplit("_", 1)[-1]  # drop the charge state if given; note this is not
-                if "_" in name and charge.lstrip("+-").isdigit():  # just a trailing digit, as in
-                    name = name.rsplit("_", 1)[0]  # e.g. ``Cd_i_Td_Te2.83``
-
-                if not (matches := [n for n in available if _check_if_name_subset(n, name)]):
-                    raise ValueError(
-                        f"Defect name {defect_name!r} does not match any of the generated point "
-                        f"defects: {list(available)}"
-                    )
-                resolved += matches
-            return resolved
+            return [
+                match
+                for name in ([names] if isinstance(names, str) else names)
+                for match in _match_defect_names(name, available, "Point defect")
+            ]
 
         nested = (
             defects is not None
@@ -2719,15 +2745,17 @@ class DefectsGenerator(MSONable):
             and not all(isinstance(entry, str) for entry in defects)
         )
         if defects is None:
-            names = list(available)
+            names = [[name] for name in available]  # each generated point defect, once
         elif nested:
-            names = [_resolve(position) for position in defects]  # type: ignore[arg-type,misc]
+            names = [_resolve(position) for position in defects]  # type: ignore[arg-type]
         else:
-            names = _resolve(cast("Iterable[str] | str", defects))
+            names = [
+                _resolve(name)
+                for name in ([defects] if isinstance(defects, str) else cast("Iterable[str]", defects))
+            ]
 
         pool = {  # any position may draw on any of the resolved names
-            name: available[name]
-            for name in (chain.from_iterable(names) if nested else names)  # type: ignore[arg-type]
+            name: available[name] for name in chain.from_iterable(names)
         }
 
         taken = {name.rsplit("_", 1)[0] for name in self.defect_entries}
@@ -2745,9 +2773,9 @@ class DefectsGenerator(MSONable):
             # also available at each position, unless the caller named the positions explicitly
             if nested:
                 continue
-            names.append(name)  # type: ignore[arg-type]
+            names.append([name])
 
-        return pool, names
+        return pool, names, nested
 
     def _add_defect_complexes(
         self, complexes: list[tuple[DefectComplex, list[str]]], pbar: tqdm | bool = True
