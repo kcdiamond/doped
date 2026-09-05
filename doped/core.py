@@ -3359,14 +3359,14 @@ class DefectComplex(core.DefectComplex, Defect):
         """
         return self.site
 
-    # TODO proper naming
     @property
     def name(self) -> str:
         """
-        Name of the defect complex: the joined names of the constituent point
-        defects, sorted alphabetically by name, e.g. ``"Te_Cd+v_Cd"``.
+        Short name of the defect complex: the joined names of the
+        constituent point defects, sorted alphabetically, e.g.
+        ``"Te_Cd-v_Cd"``.
         """
-        return "+".join(sorted(defect.name for defect in self.defects))
+        return "-".join(sorted(defect.name for defect in self.defects))
 
     def get_multiplicity(
         self,
@@ -3436,6 +3436,20 @@ class DefectComplex(core.DefectComplex, Defect):
             ),
         )
         return len(self.equivalent_complexes)
+
+    def _orbit_cart_coords(self) -> list[np.ndarray]:
+        """
+        The unwrapped Cartesian coordinates of each symmetry-equivalent
+        configuration of this complex, in the ``self.structure`` frame.
+        """
+        if not self.equivalent_complexes:
+            with contextlib.suppress(Exception):
+                self.get_multiplicity()  # populates the orbit
+
+        return [
+            self.structure.lattice.get_cartesian_coords([site.frac_coords for site in config])
+            for config in self.equivalent_complexes or [[defect.site for defect in self.defects]]
+        ]
 
     def __eq__(self, other) -> bool:
         """

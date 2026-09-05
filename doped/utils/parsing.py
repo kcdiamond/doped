@@ -2306,15 +2306,19 @@ def _get_defect_supercell_site(defect_entry: "DefectEntry", relaxed=True, **kwar
 
 
 def _get_defect_supercell_sites(
-    defect_entry: "DefectEntry", relaxed=True, **kwargs
+    defect_entry: "DefectEntry", relaxed=True, unwrapped: bool = False, **kwargs
 ) -> list[PeriodicSite] | None:
     """
     Get the constituent point defect sites of a defect `complex`, in the defect
-    supercell frame; the plural analogue of ``_get_defect_supercell_site``.
+    supercell frame (the complex analogue of ``_get_defect_supercell_site``).
 
     If ``relaxed`` (default), the relaxed site is used for substitutions, else
     the bulk site is used. The relaxed site is always used for interstitials
     (and the bulk site for substitutions).
+
+    If ``unwrapped``, the sites are returned as a single unwrapped complex
+    (i.e. not individually mapped back to the unit cell), otherwise each site
+    is wrapped into the unit cell.
 
     Returns ``None`` if ``defect_entry`` is not a defect complex, or if the
     constituent site information could not be determined.
@@ -2344,13 +2348,22 @@ def _get_defect_supercell_sites(
             ]
         return None
 
-    if defect_supercell_sites := _return_defect_supercell_sites(defect_entry, relaxed=relaxed):
-        return defect_supercell_sites
+    if not (sites := _return_defect_supercell_sites(defect_entry, relaxed=relaxed)):
+        # otherwise need to reparse info:
+        _update_defect_entry_structure_metadata(defect_entry, **kwargs)
+        if not (sites := _return_defect_supercell_sites(defect_entry, relaxed=relaxed)):
+            return None
 
-    # otherwise need to reparse info:
-    _update_defect_entry_structure_metadata(defect_entry, **kwargs)
+    if not unwrapped:
+        return [site.to_unit_cell() for site in sites]
 
-    return _return_defect_supercell_sites(defect_entry, relaxed=relaxed)
+    from doped.complexes import _get_unwrapped_complex_fc  # avoid circular import
+
+    lattice = sites[0].lattice
+    return [
+        PeriodicSite(site.species, frac_coords, lattice, properties=site.properties)
+        for site, frac_coords in zip(sites, _get_unwrapped_complex_fc(lattice, sites), strict=True)
+    ]
 
 
 def _update_defect_entry_structure_metadata(

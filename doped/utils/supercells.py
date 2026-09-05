@@ -4,13 +4,19 @@ Utility code and functions for generating & analysing defect supercells.
 
 from functools import lru_cache
 from itertools import combinations, permutations
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from pymatgen.core.lattice import Lattice
+from pymatgen.core.sites import PeriodicSite
 from pymatgen.core.structure import Structure
 from pymatgen.transformations.advanced_transformations import CubicSupercellTransformation
 from tqdm import tqdm
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from doped.core import DefectComplex, DefectEntry
 
 
 def get_min_image_distance(structure: Structure) -> float:
@@ -174,6 +180,124 @@ def _get_min_image_distance_from_matrix_raw(matrix: np.ndarray, max_ijk: int = 1
     return round(  # round to 4 decimal places to avoid tiny numerical differences messing with sorting
         np.min(distances[distances > 0]), 4
     )
+
+
+def get_complex_min_image_distance(
+    defect_complex: "DefectComplex | DefectEntry | Sequence[PeriodicSite] | np.ndarray",
+    structure: Structure | Lattice | np.ndarray | None = None,
+    coords_are_cartesian: bool = True,
+    unwrap: bool = True,
+    all_configurations: bool = False,
+) -> float:
+    r"""
+    Get the minimum image distance for a defect complex, defined as the minimum
+    distance between any constituent point defect and a constituent point
+    defect of a periodic image of the complex.
+
+    This is the defect complex analogue of ``get_min_image_distance`` (to which
+    it reduces for a single constituent). Note that, unlike the point defect
+    minimum image distance, it depends on the size and orientation of the complex
+    within the lattice.
+
+    Args:
+        defect_complex (|DefectComplex| | |DefectEntry| | Sequence[|PeriodicSite|] | np.ndarray):
+            The defect complex, as a |DefectComplex|, a |DefectEntry|, the
+            constituent point defect |PeriodicSite|\s, or an ``(n, 3)``
+            array of their coordinates.
+        structure (|Structure| | |Lattice| | np.ndarray):
+            The cell in which the complex sits, as a |Structure|, |Lattice| or
+            ``(3, 3)`` lattice matrix. Optional if ``defect_complex`` carries
+            its own cell (i.e. not an array), which this will override.
+        coords_are_cartesian (bool):
+            Whether coordinates given, if as an array, are Cartesian rather than
+            fractional. (Default: True)
+        unwrap (bool):
+            If only sites or coordinates are provided, whether to unwrap the complex
+            before computing the distance. Ignored for |DefectComplex| and
+            |DefectEntry| inputs, whose sites are already unwrapped for
+            instances constructed by ``doped``. (Default: True)
+        all_configurations (bool):
+            Whether to return the largest complex minimum image distance over
+            all symmetry-equivalent configurations  of the complex in the cell,
+            rather than that of the given configuration alone. Requires a
+            |DefectComplex| or |DefectEntry| input, from which the configurations
+            can be determined. (Default: False)
+
+    Returns:
+        float: Complex minimum image distance, in Å.
+    """
+    from doped.core import DefectComplex, DefectEntry  # avoid circular imports
+
+    configs: list[Any]  # per configuration, either constituent sites or their coordinates
+    if isinstance(defect_complex, DefectEntry):
+        from doped.utils.parsing import (  # avoid circular imports
+            _get_bulk_supercell,
+            _get_defect_supercell,
+            _get_defect_supercell_sites,
+        )
+
+        if not isinstance(defect_complex.defect, DefectComplex):
+            raise ValueError(
+                f"The given |DefectEntry| ({defect_complex.name}) is not a defect complex: use "
+                f"``get_min_image_distance`` for point defects."
+            )
+        if (sites := _get_defect_supercell_sites(defect_complex, unwrapped=True)) is None:
+            raise ValueError(
+                f"The constituent point defect sites of the given |DefectEntry| "
+                f"({defect_complex.name}) could not be determined: please provide them directly."
+            )
+        configs = [sites]
+        if all_configurations:  # all symmetry-equivalent placements in the supercell
+            configs += defect_complex.equivalent_supercell_complexes or []
+        cell = _get_bulk_supercell(defect_complex) or _get_defect_supercell(defect_complex)
+    elif isinstance(defect_complex, DefectComplex):
+        configs = (
+            defect_complex._orbit_cart_coords()  # all symmetry-equivalent configurations
+            if all_configurations
+            else [[constituent.site for constituent in defect_complex.defects]]
+        )
+        cell = defect_complex.structure
+    else:
+        if all_configurations:
+            raise ValueError(
+                "``all_configurations`` requires a |DefectComplex| or |DefectEntry| input, from which "
+                "the symmetry-equivalent configurations of the complex can be determined."
+            )  # TODO allow Structure and PeriodicSite
+        configs = [list(defect_complex)]  # |PeriodicSite|s or coordinates
+        cell = getattr(configs[0][0], "lattice", None)
+
+    # assume DefectComplex | DefectEntry objects already unwrapped
+    unwrap = unwrap and not isinstance(defect_complex, DefectComplex | DefectEntry)
+
+    if structure is not None:
+        cell = structure
+    if cell is None:
+        raise ValueError(
+            "No lattice given or found on the input coordinates: please provide ``structure``."
+        )
+    lattice = (
+        cell
+        if isinstance(cell, Lattice)
+        else (cell.lattice if isinstance(cell, Structure) else Lattice(np.asarray(cell)))
+    )
+
+    from doped.complexes import _get_unwrapped_complex_fc  # avoid circular import
+
+    dists = []
+    for config in configs:
+        if isinstance(config[0], PeriodicSite):  # cartesian
+            cart_coords = np.array([site.coords for site in config])
+        else:
+            coords = np.asarray(config, dtype=float)
+            cart_coords = coords if coords_are_cartesian else lattice.get_cartesian_coords(coords)
+
+        if unwrap:
+            cart_coords = lattice.get_cartesian_coords(
+                _get_unwrapped_complex_fc(lattice, lattice.get_fractional_coords(cart_coords))
+            )
+        dists.append(_get_complex_min_image_distance_from_matrix(lattice.matrix, cart_coords))
+
+    return max(dists)
 
 
 def _get_complex_min_image_distance_from_matrix(matrix: np.ndarray, cart_coords: np.ndarray) -> float:
